@@ -49,6 +49,10 @@ class FunctionException(Exception):
     pass
 
 
+class ParameterException(Exception):
+    pass
+
+
 _Self = TypeVar("_Self")
 P = ParamSpec("P")
 R = TypeVar("R")

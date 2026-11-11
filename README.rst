@@ -1295,6 +1295,73 @@ This works with all parameter types. For dict-based parameters like ``NamedParam
     # sql: SELECT * FROM "customers" WHERE "status"=:param1
     # params: {'param1': 'active'}
 
+Compiling SQL and Parameters in One Call
+""""""""""""""""""""""""""""""""""""""""
+
+Because ``get_sql(parameter=...)`` collects values into the parameter instance it is given, that instance must be
+managed carefully: reusing it accumulates values across runs and sharing it between threads interleaves them. The
+``compile()`` method (and the module-level ``compile_query()``) instead returns a ``CompiledQuery`` holding both the
+SQL and the parameters collected for a single run. A fresh, empty collector is created on every call from the style
+you pass in, so the reusable query tree never stores per-compilation state.
+
+.. code-block:: python
+
+    from pypika import Query, Table, QmarkParameter, NamedParameter
+
+    customers = Table('customers')
+    q = Query.from_(customers).select('*').where(
+        (customers.status == 'active') & (customers.age >= 18)
+    )
+
+    sql, params = q.compile()                       # qmark is the default style
+    # sql: SELECT * FROM "customers" WHERE "status"=? AND "age">=?
+    # params: ['active', 18]
+
+    named = q.compile(parameter=NamedParameter)    # a style class or instance works
+    # named.sql:    SELECT * FROM "customers" WHERE "status"=:param1 AND "age">=:param2
+    # named.parameters: {'param1': 'active', 'param2': 18}
+
+The same query can therefore be compiled repeatedly or from multiple threads and always yields parameters matching
+the placeholders in the returned SQL. If rendering fails, the half-collected state is local to the failed call and is
+discarded, so retrying starts clean. Each rendered placeholder collects one value, including when the same expression
+object appears more than once (for example in both ``select()`` and ``where()``). All positional styles
+(``QmarkParameter``, ``NumericParameter``, ``FormatParameter``) return a list and all named styles
+(``NamedParameter``, ``PyformatParameter``) return a dict. The legacy ``get_sql()`` call without a parameter keeps
+rendering inline literals and does not need to change.
+
+Binding Boundary for Handwritten Placeholders
+"""""""""""""""""""""""""""""""""""""""""""""
+
+There are two distinct ways placeholders enter a query:
+
+- A plain ``Parameter(':tenant')`` term is a handwritten token. It is rendered verbatim and contributes nothing to
+  the collected parameters; binding it is the caller's responsibility.
+- A ``ParameterValueWrapper(NamedParameter('tenant'), value)`` binds a value to a handwritten placeholder in the
+  tree. Its value is collected under the placeholder's key, but it can only be rendered with an active collector, so
+  ``get_sql()`` without one raises ``ParameterException`` rather than emitting a placeholder whose value was
+  silently dropped. Use ``compile()`` or ``get_sql(parameter=...)``.
+
+.. code-block:: python
+
+    from pypika import Parameter, ParameterValueWrapper, Query, Table
+
+    customers = Table('customers')
+    q = (Query.from_(customers)
+         .select(customers.id, Parameter(':tenant'))                      # external token, not collected
+         .where(customers.status == 'active')                            # auto-wrapped, collected
+         .where(customers.tenant == ParameterValueWrapper(
+             NamedParameter('tenant'), 7)))                              # handwritten + bound, collected
+
+    sql, params = q.compile(parameter=NamedParameter)
+    # sql: SELECT "id",:tenant FROM "customers"
+    #      WHERE "status"=:param1 AND "tenant"=:tenant
+    # params: {'param1': 'active', 'tenant': 7}
+
+Note that ``NamedParameter``/``PyformatParameter`` strip the leading punctuation when building dict keys
+(``:tenant`` becomes key ``tenant``), while a base ``Parameter`` keeps its placeholder spelling as the key. Mix a
+handwritten token with a positional style only if your driver accepts that token as-is, because the positional
+collector cannot re-bind a name it did not generate.
+
 Temporal support
 ^^^^^^^^^^^^^^^^
 

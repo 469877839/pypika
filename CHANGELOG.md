@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### New Features
+
+- **One-call query compilation** - `QueryBuilder.compile()` and `pypika.compile_query()` return a `CompiledQuery`
+  holding both the SQL string and the parameters collected for a single run. Each call uses a fresh, empty
+  collector, so the reusable query tree never stores per-compilation state; repeated and concurrent compilations
+  produce parameters matching the rendered placeholders, and a failed compilation leaves no partial state behind.
+- **`Parameter.fresh()`** - returns a new, empty collector that renders placeholders with the same style, allowing a
+  parameter instance to be reused as a style template across compilations without leaking collected values.
+
+### Breaking / Boundary Changes
+
+- `ParameterValueWrapper.get_sql()` without an active parameter collector now raises `ParameterException` instead of
+  rendering a placeholder whose bound value was silently dropped. Use `compile()` or `get_sql(parameter=...)`.
+  Plain `get_sql()` calls without a parameter and without `ParameterValueWrapper` are unaffected.
+
 ## v0.50.0 (2025-01-14)
 
 ### New Features

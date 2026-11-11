@@ -10,12 +10,13 @@ from collections.abc import Callable, Iterable, Iterator, Sequence
 from datetime import date, datetime, time
 from enum import Enum
 from ipaddress import IPv4Address, IPv6Address
-from typing import TYPE_CHECKING, Any, TypeVar, overload
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, overload
 
 from pypika.enums import Arithmetic, Boolean, Comparator, Dialects, Equality, JSONOperators, Matching, Order
 from pypika.utils import (
     CaseException,
     FunctionException,
+    ParameterException,
     builder,
     escape_backslashes,
     format_alias_sql,
@@ -359,6 +360,16 @@ class Term(Node):
     def get_sql(self, **kwargs: Any) -> str:
         raise NotImplementedError()
 
+    def compile(self, parameter: Parameter | type[Parameter] | None = None, **kwargs: Any) -> CompiledQuery:
+        """
+        Renders this term/query once and returns both the SQL and the parameters collected for that single run.
+
+        A fresh, empty collector is created for every call from ``parameter`` (a style class or instance), leaving
+        this term tree unchanged. Repeated or concurrent compilations therefore never share collected state. See
+        :func:`compile_query` for the equivalent module-level function.
+        """
+        return compile_query(self, parameter=parameter, **kwargs)
+
 
 def idx_placeholder_gen(idx: int) -> str:
     return str(idx + 1)
@@ -388,6 +399,17 @@ class Parameter(Term):
     def get_param_key(self, placeholder: T, **kwargs) -> T:
         return placeholder
 
+    def fresh(self) -> Parameter:
+        """
+        Returns a collector that renders placeholders exactly like this parameter but carries no collected state.
+
+        Stateless parameters (such as the base ``Parameter``) are returned as-is; collecting parameters
+        (``ListParameter``/``DictParameter`` and their subclasses) return a new, empty instance. This is what allows
+        a single parameter instance to be reused as a style template across compilations without leaking values
+        collected by a previous run.
+        """
+        return self
+
 
 class ListParameter(Parameter):
     def __init__(self, placeholder: str | int | Callable[[int], str] = idx_placeholder_gen) -> None:
@@ -406,6 +428,9 @@ class ListParameter(Parameter):
 
     def update_parameters(self, value: Any, **kwargs) -> None:
         self._parameters.append(value)
+
+    def fresh(self) -> ListParameter:
+        return type(self)(placeholder=self._placeholder)
 
 
 class DictParameter(Parameter):
@@ -428,6 +453,9 @@ class DictParameter(Parameter):
 
     def update_parameters(self, param_key: Any, value: Any, **kwargs) -> None:
         self._parameters[param_key] = value
+
+    def fresh(self) -> DictParameter:
+        return type(self)(placeholder=self._placeholder)
 
 
 class QmarkParameter(ListParameter):
@@ -464,6 +492,66 @@ class PyformatParameter(DictParameter):
 
     def get_param_key(self, placeholder: T, **kwargs) -> T:
         return placeholder[2:-2]
+
+
+class CompiledQuery(NamedTuple):
+    """
+    The result of a single compilation: the rendered SQL string and the parameters collected during that run.
+
+    ``parameters`` is a list for positional styles (qmark, numeric, format) and a dict for named styles
+    (named, pyformat), matching the order in which placeholders appear in ``sql``. As a plain tuple subclass it is
+    safe to unpack as ``sql, params = query.compile(...)``.
+    """
+
+    sql: str
+    parameters: list | dict
+
+
+def _new_collector(parameter: Parameter | type[Parameter] | None) -> Parameter:
+    """
+    Resolves the parameter argument of a compilation into a fresh, empty collector.
+
+    A class (e.g. ``QmarkParameter``) is instantiated, an instance (e.g. ``QmarkParameter()``) is used as a style
+    template via :meth:`Parameter.fresh`, and ``None`` defaults to qmark style. The base, stateless ``Parameter``
+    cannot collect values and is rejected so that bound values are never silently lost.
+    """
+    if parameter is None:
+        return QmarkParameter()
+    if isinstance(parameter, type):
+        if not issubclass(parameter, (ListParameter, DictParameter)):
+            raise ParameterException(
+                "Cannot collect bound values with {name!r}; pass a collecting parameter style instead "
+                "(QmarkParameter, NumericParameter, FormatParameter, NamedParameter or PyformatParameter).".format(
+                    name=parameter.__name__
+                )
+            )
+        parameter = parameter()
+    if not isinstance(parameter, (ListParameter, DictParameter)):
+        raise ParameterException(
+            "Cannot collect bound values with {name!r}; pass a collecting parameter style instead "
+            "(QmarkParameter, NumericParameter, FormatParameter, NamedParameter or PyformatParameter).".format(
+                name=type(parameter).__name__
+            )
+        )
+    return parameter.fresh()
+
+
+def compile_query(query: Any, parameter: Parameter | type[Parameter] | None = None, **kwargs: Any) -> CompiledQuery:
+    """
+    Renders ``query`` once and returns both the SQL string and the parameters collected during that compilation.
+
+    A brand-new collector is created for every call from the supplied style, so:
+
+    * the reusable query tree never holds per-compilation state and can be compiled repeatedly or concurrently;
+    * parameter order/keys always match the placeholders actually rendered in the returned SQL;
+    * if rendering raises, no half-collected state is observable because the collector is local to this call.
+
+    ``query`` may be a :class:`~pypika.queries.QueryBuilder`, a set operation or any term exposing ``get_sql``.
+    Extra keyword arguments are forwarded to ``get_sql`` exactly as with the legacy entry point.
+    """
+    collector = _new_collector(parameter)
+    sql = query.get_sql(parameter=collector, **kwargs)
+    return CompiledQuery(sql=sql, parameters=collector.get_parameters())
 
 
 class Negative(Term):
@@ -564,15 +652,44 @@ class ValueWrapper(Term):
 
 
 class ParameterValueWrapper(ValueWrapper):
+    """
+    A value bound to a placeholder that is part of the query tree itself (a "handwritten" parameter).
+
+    Unlike plain auto-wrapped values, the placeholder is owned by this term and the value can only be collected by an
+    active compilation. Rendering without a parameter collector would emit a placeholder whose bound value was
+    silently lost, so ``get_sql`` raises ``ParameterException`` instead.
+    """
+
     def __init__(self, parameter: Parameter, value: Any, alias: str | None = None) -> None:
         super().__init__(value, alias)
         self._parameter = parameter
+
+    @property
+    def parameter(self) -> Parameter:
+        return self._parameter
 
     def _get_param_data(self, parameter: Parameter, **kwargs) -> tuple[str, str]:
         param_sql = self._parameter.get_sql(**kwargs)
         param_key = self._parameter.get_param_key(placeholder=param_sql)
 
         return param_sql, param_key
+
+    def get_sql(
+        self,
+        quote_char: str | None = None,
+        secondary_quote_char: str = "'",
+        parameter: Parameter = None,
+        **kwargs: Any,
+    ) -> str:
+        if parameter is None:
+            raise ParameterException(
+                "ParameterValueWrapper carries a value bound to placeholder {placeholder!r}; it can only be rendered "
+                "with an active parameter collector. Use query.compile(...) or get_sql(parameter=...) so the bound "
+                "value is collected instead of being silently dropped.".format(placeholder=self._parameter.placeholder)
+            )
+        return super().get_sql(
+            quote_char=quote_char, secondary_quote_char=secondary_quote_char, parameter=parameter, **kwargs
+        )
 
 
 class JSON(Term):
