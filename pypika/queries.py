@@ -758,6 +758,9 @@ class QueryBuilder(Selectable, Term):
     ALIAS_QUOTE_CHAR = None
     QUERY_ALIAS_QUOTE_CHAR = None
     QUERY_CLS = Query
+    # Whether the target database supports the standard FILTER(WHERE ...) clause on aggregate functions.
+    # Dialects without native support override this to False, which switches aggregates to CASE-based rewrites.
+    SUPPORTS_AGGREGATE_FILTER = True
 
     def __init__(
         self,
@@ -1307,6 +1310,7 @@ class QueryBuilder(Selectable, Term):
         kwargs.setdefault("alias_quote_char", self.ALIAS_QUOTE_CHAR)
         kwargs.setdefault("as_keyword", self.as_keyword)
         kwargs.setdefault("dialect", self.dialect)
+        kwargs.setdefault("supports_aggregate_filter", self.SUPPORTS_AGGREGATE_FILTER)
 
     def get_sql(self, with_alias: bool = False, subquery: bool = False, **kwargs: Any) -> str:
         self._set_kwargs_defaults(kwargs)

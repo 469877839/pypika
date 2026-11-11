@@ -96,6 +96,7 @@ class MySQLQuery(Query):
 
 
 class MySQLQueryBuilder(QueryBuilder):
+    SUPPORTS_AGGREGATE_FILTER = False
     QUOTE_CHAR = "`"
     QUERY_CLS = MySQLQuery
 
@@ -258,6 +259,7 @@ class VerticaQuery(Query):
 
 
 class VerticaQueryBuilder(QueryBuilder):
+    SUPPORTS_AGGREGATE_FILTER = False
     QUERY_CLS = VerticaQuery
 
     def __init__(self, **kwargs: Any) -> None:
@@ -382,6 +384,7 @@ class OracleQuery(Query):
 
 
 class OracleQueryBuilder(FetchNextAndOffsetRowsQueryBuilder):
+    SUPPORTS_AGGREGATE_FILTER = False
     QUOTE_CHAR = None
     QUERY_CLS = OracleQuery
 
@@ -687,6 +690,7 @@ class RedshiftQuery(Query):
 
 
 class RedShiftQueryBuilder(QueryBuilder):
+    SUPPORTS_AGGREGATE_FILTER = False
     QUERY_CLS = RedshiftQuery
 
 
@@ -701,6 +705,7 @@ class MSSQLQuery(Query):
 
 
 class MSSQLQueryBuilder(FetchNextAndOffsetRowsQueryBuilder):
+    SUPPORTS_AGGREGATE_FILTER = False
     QUERY_CLS = MSSQLQuery
 
     def __init__(self, **kwargs: Any) -> None:
@@ -798,6 +803,7 @@ class ClickHouseQuery(Query):
 
 
 class ClickHouseQueryBuilder(QueryBuilder):
+    SUPPORTS_AGGREGATE_FILTER = False
     QUERY_CLS = ClickHouseQuery
 
     _distinct_on: list[Term]

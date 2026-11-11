@@ -1563,9 +1563,15 @@ class Function(Criterion):
         with_namespace = kwargs.pop("with_namespace", False)
         quote_char = kwargs.pop("quote_char", None)
         dialect = kwargs.pop("dialect", None)
+        supports_aggregate_filter = kwargs.pop("supports_aggregate_filter", True)
 
         # FIXME escape
-        function_sql = self.get_function_sql(with_namespace=with_namespace, quote_char=quote_char, dialect=dialect)
+        function_sql = self.get_function_sql(
+            with_namespace=with_namespace,
+            quote_char=quote_char,
+            dialect=dialect,
+            supports_aggregate_filter=supports_aggregate_filter,
+        )
 
         if self.schema is not None:
             function_sql = "{schema}.{function}".format(
@@ -1597,7 +1603,39 @@ class AggregateFunction(Function):
         if self._include_filter:
             return "WHERE {criterions}".format(criterions=Criterion.all(self._filters).get_sql(**kwargs))
 
+    def _get_filter_case_sql(self, **kwargs: Any) -> str:
+        """
+        Renders the filter as a CASE expression for dialects without native FILTER support. Rows for which the
+        filter criterion evaluates to NULL (e.g. the filter contains NULL) fall through to the ELSE branch and are
+        excluded, which matches the semantics of FILTER(WHERE ...).
+        """
+        criterion = Criterion.all(self._filters)
+        case = Case().when(criterion, self._get_filter_arg())
+        return case.get_sql(**kwargs)
+
+    def _get_filter_arg(self) -> "Term":
+        # COUNT(*) is rewritten as COUNT(CASE ... THEN 1 END) since CASE cannot return *.
+        if self.name.upper() == "COUNT" and len(self.args) == 1 and isinstance(self.args[0], Star):
+            return ValueWrapper(1)
+        return self.args[0]
+
+    def _get_filtered_function_sql(self, **kwargs: Any) -> str:
+        # Only the five aggregate functions have a semantically equivalent CASE rewrite, both as plain
+        # aggregates and as window expressions. Other functions (e.g. ROW_NUMBER, LAG, LAST_VALUE or custom
+        # aggregates) have no equivalent and raise instead of receiving an incorrect rewrite.
+        if self.name.upper() not in ("COUNT", "SUM", "AVG", "MIN", "MAX"):
+            raise FunctionException(
+                "Aggregate function {name} has no CASE-based equivalent for FILTER(WHERE ...) and the target "
+                "dialect does not support the FILTER clause.".format(name=self.name)
+            )
+
+        case_sql = self._get_filter_case_sql(**kwargs)
+        return "{name}({args})".format(name=self.name, args=case_sql)
+
     def get_function_sql(self, **kwargs: Any):
+        if self._include_filter and not kwargs.get("supports_aggregate_filter", True):
+            return self._get_filtered_function_sql(**kwargs)
+
         sql = super().get_function_sql(**kwargs)
         filter_sql = self.get_filter_sql(**kwargs)
 
