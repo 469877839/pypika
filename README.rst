@@ -166,6 +166,61 @@ This results in the following SQL:
 
     SELECT "id","fname","lname","phone" FROM "customers" ORDER BY "id" DESC
 
+The position of NULL values can be controlled explicitly with ``NullsOrdering``:
+
+.. code-block:: python
+
+    from pypika import NullsOrdering
+
+    Query.from_('customers').select('id', 'phone').orderby(
+        'phone', order=Order.asc, nulls=NullsOrdering.last
+    )
+
+.. code-block:: sql
+
+    SELECT "id","phone" FROM "customers" ORDER BY "phone" ASC NULLS LAST
+
+Seek (keyset) pagination
+""""""""""""""""""""""""
+
+Instead of OFFSET, a page can be fetched by passing the values of the last row of the
+previous page to ``seek_after``. The seek predicate is derived directly from the query's
+ORDER BY clause, so every ORDER BY term must be a plain column with an explicit direction
+and an explicit NULL position, and the ordering must end with a unique key (for example a
+primary key) so the order is deterministic. Aggregate, random and other non-deterministic
+ORDER BY expressions are rejected with a ``SeekException`` before any SQL is generated.
+
+.. code-block:: python
+
+    from pypika import NullsOrdering, Order
+
+    logs = Table('logs')
+    query = (
+        Query.from_(logs)
+        .select(logs.id, logs.created_at)
+        .orderby(logs.created_at, order=Order.asc, nulls=NullsOrdering.last)
+        .orderby(logs.id, order=Order.asc, nulls=NullsOrdering.last)
+        .limit(100)
+    )
+
+    # first page
+    first_page = query
+
+    # next page: pass the ordered values of the last row of the previous page
+    last_row = first_page_result[-1]
+    next_page = query.seek_after(last_row.created_at, last_row.id)
+
+.. code-block:: sql
+
+    SELECT "id","created_at" FROM "logs"
+    WHERE (("created_at" IS NOT NULL AND "created_at">'2024-01-01') OR "created_at" IS NULL)
+       OR ("id" IS NOT NULL AND "id">42 AND "created_at"='2024-01-01')
+    ORDER BY "created_at" ASC NULLS LAST,"id" ASC NULLS LAST LIMIT 100
+
+Pass ``None`` for a NULL cursor value, or a ``Parameter`` such as ``Parameter("?")`` to
+render a placeholder and bind the value yourself. The existing WHERE clause is preserved
+(the seek predicate is combined with it using AND) and the original query is never mutated.
+
 Arithmetic
 """"""""""
 

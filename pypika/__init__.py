@@ -62,6 +62,7 @@ from pypika.dialects import (
 from pypika.enums import (
     DatePart,
     JoinType,
+    NullsOrdering,
     Order,
 )
 
@@ -115,6 +116,7 @@ from pypika.utils import (
     JoinException,
     QueryException,
     RollupException,
+    SeekException,
     SetOperationException,
 )
 
@@ -138,6 +140,7 @@ __all__ = (
     'VerticaQuery',
     'DatePart',
     'JoinType',
+    'NullsOrdering',
     'Order',
     'AliasedQuery',
     'Query',
@@ -175,6 +178,7 @@ __all__ = (
     'JoinException',
     'QueryException',
     'RollupException',
+    'SeekException',
     'SetOperationException',
     'FunctionException',
     'NULL',

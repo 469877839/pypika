@@ -6,15 +6,20 @@ from copy import copy
 from functools import reduce
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
-from pypika.enums import Dialects, JoinType, ReferenceOption, SetOperation
+from pypika.enums import Dialects, Equality, JoinType, NullsOrdering, Order, ReferenceOption, SetOperation
 from pypika.terms import (
+    AggregateFunction,
     ArithmeticExpression,
+    BasicCriterion,
+    Bracket,
     Criterion,
     EmptyCriterion,
     Field,
     Function,
     Index,
     Node,
+    NullValue,
+    Parameter,
     PeriodCriterion,
     Rollup,
     Star,
@@ -26,6 +31,7 @@ from pypika.utils import (
     JoinException,
     QueryException,
     RollupException,
+    SeekException,
     SetOperationException,
     builder,
     format_alias_sql,
@@ -44,6 +50,30 @@ __email__ = "theys@kayak.com"
 
 
 QB = TypeVar("QB", bound="QueryBuilder")
+
+
+def _format_orderby_clause(term_sql: str, order: Order | None, nulls: NullsOrdering | None) -> str:
+    clause = "{term} {orient}".format(term=term_sql, orient=order.value) if order is not None else term_sql
+    if nulls is not None:
+        clause = "{clause} {nulls}".format(clause=clause, nulls=nulls.value)
+    return clause
+
+
+#: Function names whose result is not stable across executions. An ORDER BY based
+#: on them cannot be reproduced by a seek predicate, so keyset pagination rejects them.
+_NONDETERMINISTIC_ORDERBY_FUNCTIONS = frozenset(
+    {
+        "RANDOM",
+        "RAND",
+        "UUID",
+        "UUID_SHORT",
+        "NEWID",
+        "NEWSEQUENTIALID",
+        "GENERATE_UUID",
+        "SYS_GUID",
+        "RANDOM_BYTES",
+    }
+)
 
 
 class Selectable(Node):
@@ -622,7 +652,7 @@ class _SetOperation(Selectable, Term):
                 else self.base_query.wrap_constant(field)
             )
 
-            self._orderbys.append((field, kwargs.get("order")))
+            self._orderbys.append((field, kwargs.get("order"), kwargs.get("nulls")))
 
     @builder
     def limit(self, limit: int) -> None:
@@ -727,16 +757,14 @@ class _SetOperation(Selectable, Term):
         """
         clauses = []
         selected_aliases = {s.alias for s in self.base_query._selects}
-        for field, directionality in self._orderbys:
+        for field, directionality, nulls_ordering in self._orderbys:
             term = (
                 format_quotes(field.alias, quote_char)
                 if field.alias and field.alias in selected_aliases
                 else field.get_sql(quote_char=quote_char, **kwargs)
             )
 
-            clauses.append(
-                "{term} {orient}".format(term=term, orient=directionality.value) if directionality is not None else term
-            )
+            clauses.append(_format_orderby_clause(term, directionality, nulls_ordering))
 
         return " ORDER BY {orderby}".format(orderby=",".join(clauses))
 
@@ -893,7 +921,8 @@ class QueryBuilder(Selectable, Term):
         self._havings = self._havings.replace_table(current_table, new_table) if self._havings else None
         self._qualifys = self._qualifys.replace_table(current_table, new_table) if self._qualifys else None
         self._orderbys = [
-            (orderby[0].replace_table(current_table, new_table), orderby[1]) for orderby in self._orderbys
+            (orderby[0].replace_table(current_table, new_table), orderby[1], orderby[2])
+            for orderby in self._orderbys
         ]
         self._joins = [join.replace_table(current_table, new_table) for join in self._joins]
 
@@ -1078,10 +1107,160 @@ class QueryBuilder(Selectable, Term):
 
     @builder
     def orderby(self, *fields: Any, **kwargs: Any) -> None:
+        nulls_ordering = kwargs.get("nulls")
+        if nulls_ordering is not None and not isinstance(nulls_ordering, NullsOrdering):
+            raise QueryException("Order by nulls must be a NullsOrdering, got '%s'" % nulls_ordering)
+
         for field in fields:
             field = Field(field, table=self._from[0]) if isinstance(field, str) else self.wrap_constant(field)
 
-            self._orderbys.append((field, kwargs.get("order")))
+            self._orderbys.append((field, kwargs.get("order"), nulls_ordering))
+
+    @builder
+    def seek_after(self, *cursor_values: Any) -> None:
+        """
+        Adds a seek (keyset) pagination predicate to the query, derived from its ORDER BY clause.
+
+        ``cursor_values`` are the ordered values of the last row of the previous page, one per
+        ORDER BY term. They are applied positionally: the first value pairs with the first
+        ORDER BY term and so on. ``None`` renders as SQL ``null`` and any
+        :class:`pypika.terms.Parameter` instance is rendered as a placeholder so the value can
+        be bound by the caller; plain values are inlined.
+
+        Every ORDER BY term must be a plain column with an explicit direction
+        (``order``) and an explicit NULL position (``nulls``), and the ordering must be
+        deterministic, i.e. backed by a unique tail key. Aggregate, random and other
+        non-deterministic ORDER BY expressions are rejected. All validation happens before any
+        SQL is generated.
+
+        The predicate is combined with the existing WHERE clause via AND, on a copy of the
+        query, leaving the original query untouched.
+        """
+        seek_criterion = self._build_seek_criterion(cursor_values)
+        if self._wheres:
+            self._wheres &= seek_criterion
+        else:
+            self._wheres = seek_criterion
+
+    def _build_seek_criterion(self, cursor_values: tuple[Any, ...]) -> Criterion:
+        seek_orderbys = self._validate_seek_orderbys(cursor_values)
+
+        cursor_terms = [self._wrap_seek_value(value) for value in cursor_values]
+
+        seek_criterion = None
+        for index, ((field, order, nulls), cursor) in enumerate(zip(seek_orderbys, cursor_terms)):
+            column_criterion = self._seek_column_criterion(field, order, nulls, cursor)
+
+            for previous_index in range(index):
+                previous_field = seek_orderbys[previous_index][0]
+                previous_cursor = cursor_terms[previous_index]
+                if isinstance(previous_cursor, NullValue):
+                    equality = previous_field.isnull()
+                else:
+                    equality = previous_field == previous_cursor
+                column_criterion = column_criterion & equality
+
+            seek_criterion = (
+                Bracket(column_criterion)
+                if seek_criterion is None
+                else seek_criterion | Bracket(column_criterion)
+            )
+
+        return seek_criterion
+
+    def _validate_seek_orderbys(self, cursor_values: tuple[Any, ...]) -> list[tuple[Field, Order, NullsOrdering]]:
+        if not self._orderbys:
+            raise SeekException("seek_after requires an ORDER BY clause to derive the seek predicate from")
+
+        if len(cursor_values) != len(self._orderbys):
+            raise SeekException(
+                "seek_after expected {expected} cursor value(s), one per ORDER BY term, got {actual}".format(
+                    expected=len(self._orderbys), actual=len(cursor_values)
+                )
+            )
+
+        seek_orderbys = []
+        for term, order, nulls in self._orderbys:
+            if order is None:
+                raise SeekException(
+                    "seek_after requires an explicit direction for every ORDER BY term, none given for '{term}'".format(
+                        term=term.get_sql()
+                    )
+                )
+            if nulls is None:
+                raise SeekException(
+                    "seek_after requires an explicit NULLS FIRST or NULLS LAST for every ORDER BY term, "
+                    "none given for '{term}'".format(term=term.get_sql())
+                )
+            self._validate_seek_orderby_term(term)
+            seek_orderbys.append((term, order, nulls))
+
+        return seek_orderbys
+
+    def _validate_seek_orderby_term(self, term: Term) -> None:
+        if isinstance(term, AggregateFunction) or term.is_aggregate is True:
+            raise SeekException(
+                "seek_after does not support aggregate ORDER BY expressions, got '{term}'".format(
+                    term=term.get_sql()
+                )
+            )
+        if isinstance(term, Function):
+            if term.name.upper() in _NONDETERMINISTIC_ORDERBY_FUNCTIONS:
+                raise SeekException(
+                    "seek_after does not support non-deterministic ORDER BY expression '{term}'".format(
+                        term=term.get_sql()
+                    )
+                )
+            raise SeekException(
+                "seek_after only supports plain column ORDER BY terms, got function expression '{term}'".format(
+                    term=term.get_sql()
+                )
+            )
+        if not isinstance(term, Field) or isinstance(term, Star):
+            raise SeekException(
+                "seek_after only supports plain column ORDER BY terms, got '{term}'".format(term=term.get_sql())
+            )
+
+    @staticmethod
+    def _wrap_seek_value(value: Any) -> Term:
+        if isinstance(value, Term):
+            if isinstance(value, Parameter):
+                return value
+            if isinstance(value, ValueWrapper):
+                return value
+            if isinstance(value, NullValue):
+                return value
+            raise SeekException(
+                "seek_after cursor values must be plain values, None or Parameters, got '{value}'".format(
+                    value=value.get_sql()
+                )
+            )
+        return Term.wrap_constant(value)
+
+    @staticmethod
+    def _seek_column_criterion(field: Field, order: Order, nulls: NullsOrdering, cursor: Term) -> Criterion:
+        cursor_is_null = isinstance(cursor, NullValue)
+
+        if nulls == NullsOrdering.first:
+            # NULL rows sort first. A non-NULL cursor is always past the NULL group, so NULL
+            # rows are never returned; a NULL cursor is the first rank, so only non-NULL rows remain.
+            if cursor_is_null:
+                return field.isnotnull()
+            comparison = field > cursor if order == Order.asc else field < cursor
+            return field.isnotnull() & comparison
+
+        if order == Order.asc:
+            if cursor_is_null:
+                # NULLs sort last, so nothing comes after a NULL cursor
+                return BasicCriterion(Equality.eq, ValueWrapper(1), ValueWrapper(0))
+            # non-NULL rows strictly after the cursor, followed by the trailing NULL group
+            return (field.isnotnull() & (field > cursor)) | field.isnull()
+
+        if cursor_is_null:
+            # NULLs sort last, so nothing comes after a NULL cursor
+            return BasicCriterion(Equality.eq, ValueWrapper(1), ValueWrapper(0))
+        # non-NULL rows strictly before the cursor, then the trailing NULL group
+        return (field.isnotnull() & (field < cursor)) | field.isnull()
 
     @builder
     def join(
@@ -1584,16 +1763,14 @@ class QueryBuilder(Selectable, Term):
         """
         clauses = []
         selected_aliases = {s.alias for s in self._selects}
-        for field, directionality in self._orderbys:
+        for field, directionality, nulls_ordering in self._orderbys:
             term = (
                 format_quotes(field.alias, alias_quote_char or quote_char)
                 if orderby_alias and field.alias and field.alias in selected_aliases
                 else field.get_sql(quote_char=quote_char, alias_quote_char=alias_quote_char, **kwargs)
             )
 
-            clauses.append(
-                "{term} {orient}".format(term=term, orient=directionality.value) if directionality is not None else term
-            )
+            clauses.append(_format_orderby_clause(term, directionality, nulls_ordering))
 
         return " ORDER BY {orderby}".format(orderby=",".join(clauses))
 

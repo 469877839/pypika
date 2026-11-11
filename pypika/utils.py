@@ -49,6 +49,10 @@ class FunctionException(Exception):
     pass
 
 
+class SeekException(QueryException):
+    pass
+
+
 _Self = TypeVar("_Self")
 P = ParamSpec("P")
 R = TypeVar("R")
