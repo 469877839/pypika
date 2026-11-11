@@ -809,29 +809,23 @@ class NestedSetOperationTests(unittest.TestCase):
 
     def test_mismatched_nested_operand(self):
         inner = self.query2.select("bar").union(self.query3.select("bar"))
-        query = self.query1.union(inner)
 
         with self.assertRaises(SetOperationException) as context:
-            str(query)
+            self.query1.union(inner)
 
         self.assertEqual(
-            'Queries must have an equal number of select statements in a set operation.\n\n'
-            'Main Query:\n(SELECT "foo" FROM "abc")\n\nSet Operations Query:\n'
-            '((SELECT "foo","bar" FROM "efg") UNION (SELECT "foo","bar" FROM "hij"))',
+            "Queries combined with UNION must expose the same number of output columns:"
+            " 1 column(s) ('foo',) cannot be combined with 2 column(s) ('foo', 'bar').",
             str(context.exception),
         )
 
     def test_inner_mismatch_is_reported_first(self):
-        inner = self.query2.union(self.query3.select("bar"))
-        query = self.query1.select("bar", "baz").union(inner)
-
         with self.assertRaises(SetOperationException) as context:
-            str(query)
+            self.query2.union(self.query3.select("bar"))
 
         self.assertEqual(
-            'Queries must have an equal number of select statements in a set operation.\n\n'
-            'Main Query:\n(SELECT "foo" FROM "efg")\n\nSet Operations Query:\n'
-            '(SELECT "foo","bar" FROM "hij")',
+            "Queries combined with UNION must expose the same number of output columns:"
+            " 1 column(s) ('foo',) cannot be combined with 2 column(s) ('foo', 'bar').",
             str(context.exception),
         )
 
@@ -1244,10 +1238,10 @@ class MinusTests(unittest.TestCase):
         query2 = Query.from_(self.table2).select(self.table2.bar.as_("a"))
 
         minus_query = query1.minus(query2)
-        minus_query = str(minus_query.orderby(minus_query.field("b")))
+        minus_query = str(minus_query.orderby(minus_query.field("a")))
 
         self.assertEqual(
-            '(SELECT "foo" "a" FROM "abc") ' "MINUS " '(SELECT "bar" "a" FROM "efg") ' 'ORDER BY "b"',
+            '(SELECT "foo" "a" FROM "abc") ' "MINUS " '(SELECT "bar" "a" FROM "efg") ' 'ORDER BY "a"',
             minus_query,
         )
 
@@ -1327,10 +1321,10 @@ class ExceptOfTests(unittest.TestCase):
         query2 = Query.from_(self.table2).select(self.table2.bar.as_("a"))
 
         except_query = query1.except_of(query2)
-        except_query = str(except_query.orderby(except_query.field("b")))
+        except_query = str(except_query.orderby(except_query.field("a")))
 
         self.assertEqual(
-            '(SELECT "foo" "a" FROM "abc") ' "EXCEPT " '(SELECT "bar" "a" FROM "efg") ' 'ORDER BY "b"',
+            '(SELECT "foo" "a" FROM "abc") ' "EXCEPT " '(SELECT "bar" "a" FROM "efg") ' 'ORDER BY "a"',
             except_query,
         )
 

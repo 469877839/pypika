@@ -6,6 +6,7 @@ from copy import copy
 from functools import reduce
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
+from pypika.contracts import OutputColumnContract, from_terms as _contract_from_terms
 from pypika.enums import Dialects, JoinType, ReferenceOption, SetOperation
 from pypika.terms import (
     ArithmeticExpression,
@@ -613,8 +614,72 @@ class _SetOperation(Selectable, Term):
 
         self._wrapper_cls = wrapper_cls
 
+        self._validate_operand(self.base_query, set_operation_query, set_operation)
+
+    def __copy__(self) -> _SetOperation:
+        newone = type(self).__new__(type(self))
+        newone.__dict__.update(self.__dict__)
+        newone._set_operation = copy(self._set_operation)
+        newone._orderbys = copy(self._orderbys)
+        return newone
+
+    @staticmethod
+    def _operand_contract(operand: QueryBuilder | _SetOperation) -> OutputColumnContract:
+        return operand.output_columns
+
+    @property
+    def output_columns(self) -> OutputColumnContract:
+        """
+        Statically derived description of the set operation's output columns.
+
+        A set operation takes its output names from its first (left-most) branch. The contract is
+        unknown whenever any branch contains a projection that cannot be expanded statically.
+        """
+        contract = self._operand_contract(self.base_query)
+        if not contract.known:
+            return contract
+
+        for _, operand in self._set_operation:
+            operand_contract = self._operand_contract(operand)
+            if not operand_contract.known:
+                return operand_contract
+
+        return contract
+
+    def _operands(self) -> list[QueryBuilder | _SetOperation]:
+        return [self.base_query, *[operand for _, operand in self._set_operation]]
+
+    def _validate_operand(
+        self,
+        left: QueryBuilder | _SetOperation,
+        right: QueryBuilder | _SetOperation,
+        set_operation: SetOperation,
+    ) -> None:
+        """
+        Checks the column contract of a single composition without rendering SQL or touching a
+        database. Unknown expansions (``*``) cannot be checked here and are left to the database.
+        """
+        left_contract = self._operand_contract(left)
+        right_contract = self._operand_contract(right)
+
+        if not left_contract.known or not right_contract.known:
+            return
+
+        if len(left_contract) != len(right_contract):
+            raise SetOperationException(
+                "Queries combined with {operation} must expose the same number of output columns:"
+                " {left_count} column(s) {left_names} cannot be combined with {right_count} column(s)"
+                " {right_names}.".format(
+                    operation=set_operation.value,
+                    left_count=len(left_contract),
+                    left_names=left_contract.names,
+                    right_count=len(right_contract),
+                    right_names=right_contract.names,
+                )
+            )
+
     @builder
-    def orderby(self, *fields: Field, **kwargs: Any) -> None:
+    def orderby(self, *fields: Any, **kwargs: Any) -> None:
         for field in fields:
             field = (
                 Field(field, table=self.base_query._from[0])
@@ -622,7 +687,51 @@ class _SetOperation(Selectable, Term):
                 else self.base_query.wrap_constant(field)
             )
 
+            self._validate_orderby_field(field)
             self._orderbys.append((field, kwargs.get("order")))
+
+    def _validate_orderby_field(self, field: Any) -> None:
+        contract = self.output_columns
+        if not contract.known:
+            return
+
+        if isinstance(field, Field):
+            name = field.alias or field.name
+            if field.table is not None and not isinstance(field.table, _SetOperation):
+                table = field.table
+                branch_tables = [
+                    branch
+                    for operand in self._operands()
+                    if isinstance(operand, QueryBuilder)
+                    for branch in operand._from
+                ]
+                if table in branch_tables:
+                    if not contract.find_name(name):
+                        raise SetOperationException(
+                            "ORDER BY name {name!r} does not match any output column of the set"
+                            " operation {names}; outer ORDER BY cannot reference branch-only columns.".format(
+                                name=name, names=contract.names
+                            )
+                        )
+                    return
+            if not contract.find_name(name):
+                raise SetOperationException(
+                    "ORDER BY name {name!r} does not match any output column of the set operation"
+                    " {names}. Outer ORDER BY may only reference output names or positions.".format(
+                        name=name, names=contract.names
+                    )
+                )
+            return
+
+        if isinstance(field, ValueWrapper) and isinstance(field.value, int) and not isinstance(field.value, bool):
+            position = field.value
+            if position < 1 or position > len(contract):
+                raise SetOperationException(
+                    "ORDER BY position {position} is out of range for a set operation with"
+                    " {count} output column(s) {names}.".format(
+                        position=position, count=len(contract), names=contract.names
+                    )
+                )
 
     @builder
     def limit(self, limit: int) -> None:
@@ -634,22 +743,27 @@ class _SetOperation(Selectable, Term):
 
     @builder
     def union(self, other: Selectable) -> None:
+        self._validate_operand(self.base_query, other, SetOperation.union)
         self._set_operation.append((SetOperation.union, other))
 
     @builder
     def union_all(self, other: Selectable) -> None:
+        self._validate_operand(self.base_query, other, SetOperation.union_all)
         self._set_operation.append((SetOperation.union_all, other))
 
     @builder
     def intersect(self, other: Selectable) -> None:
+        self._validate_operand(self.base_query, other, SetOperation.intersect)
         self._set_operation.append((SetOperation.intersect, other))
 
     @builder
     def except_of(self, other: Selectable) -> None:
+        self._validate_operand(self.base_query, other, SetOperation.except_of)
         self._set_operation.append((SetOperation.except_of, other))
 
     @builder
     def minus(self, other: Selectable) -> None:
+        self._validate_operand(self.base_query, other, SetOperation.minus)
         self._set_operation.append((SetOperation.minus, other))
 
     def __add__(self, other: Selectable) -> _SetOperation:
@@ -682,16 +796,22 @@ class _SetOperation(Selectable, Term):
                 **kwargs,
             )
 
-            set_operation_selects = (
-                set_operation_query.base_query._selects
-                if isinstance(set_operation_query, _SetOperation)
-                else set_operation_query._selects
-            )
-            if len(self.base_query._selects) != len(set_operation_selects):
+            # Re-check the column contract in case operands were mutated after composition.
+            base_contract = self._operand_contract(self.base_query)
+            operand_contract = self._operand_contract(set_operation_query)
+            if base_contract.known and operand_contract.known and len(base_contract) != len(operand_contract):
                 raise SetOperationException(
-                    "Queries must have an equal number of select statements in a set operation."
+                    "Queries combined with {operation} must expose the same number of output columns:"
+                    " {left_count} column(s) {left_names} cannot be combined with {right_count} column(s)"
+                    " {right_names}."
                     "\n\nMain Query:\n{query1}\n\nSet Operations Query:\n{query2}".format(
-                        query1=base_querystring, query2=set_operation_querystring
+                        operation=set_operation.value,
+                        left_count=len(base_contract),
+                        left_names=base_contract.names,
+                        right_count=len(operand_contract),
+                        right_names=operand_contract.names,
+                        query1=base_querystring,
+                        query2=set_operation_querystring,
                     )
                 )
 
@@ -1081,6 +1201,7 @@ class QueryBuilder(Selectable, Term):
         for field in fields:
             field = Field(field, table=self._from[0]) if isinstance(field, str) else self.wrap_constant(field)
 
+            self._validate_set_operation_reference(field)
             self._orderbys.append((field, kwargs.get("order")))
 
     @builder
@@ -1188,6 +1309,16 @@ class QueryBuilder(Selectable, Term):
     def _list_aliases(field_set: Sequence[Field], quote_char: str | None = None) -> list[str]:
         return [field.alias or field.get_sql(quote_char=quote_char) for field in field_set]
 
+    @property
+    def output_columns(self) -> OutputColumnContract:
+        """
+        Statically derived description of this query's output columns.
+
+        Ordinary projections expose their count and output names; projections containing ``*`` or
+        ``table.*`` return an unknown contract rather than guessing the expanded columns.
+        """
+        return _contract_from_terms(self._selects, quote_char=self.QUOTE_CHAR)
+
     def _select_field_str(self, term: str) -> None:
         if 0 == len(self._from):
             raise QueryException(f"Cannot select {term}, no FROM table specified.")
@@ -1214,7 +1345,28 @@ class QueryBuilder(Selectable, Term):
             ]
             self._select_star_tables.add(term.table)
 
+        self._validate_set_operation_reference(term)
         self._selects.append(term)
+
+    def _set_operation_contract_for(self, table: Any) -> OutputColumnContract | None:
+        if isinstance(table, _SetOperation):
+            return table.output_columns
+        if isinstance(table, AliasedQuery) and isinstance(table.query, _SetOperation):
+            return table.query.output_columns
+        return None
+
+    def _validate_set_operation_reference(self, term: Term) -> None:
+        if not isinstance(term, Field) or isinstance(term, Star):
+            return
+
+        contract = self._set_operation_contract_for(term.table)
+        if contract is not None and contract.known and not contract.find_name(term.name):
+            raise SetOperationException(
+                "Reference {name!r} does not match any output column of the set operation {names}."
+                " Outer queries can only reference the set operation's output columns.".format(
+                    name=term.name, names=contract.names
+                )
+            )
 
     def _select_other(self, function: Function) -> None:
         self._selects.append(function)

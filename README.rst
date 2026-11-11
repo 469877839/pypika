@@ -580,8 +580,9 @@ Unions
 """"""
 
 Both ``UNION`` and ``UNION ALL`` are supported. ``UNION DISTINCT`` is synonymous with ``UNION`` so |Brand| does not
-provide a separate function for it.  Unions require that queries have the same number of ``SELECT`` clauses so
-trying to cast a unioned query to string will throw a ``SetOperationException`` if the column sizes are mismatched.
+provide a separate function for it.  Unions require that queries have the same number of output columns, so
+combining incompatible queries raises a ``SetOperationException`` with the mismatched column contracts when the
+set operation is built, before any SQL is rendered or database call is made.
 
 To create a union query, use either the ``Query.union()`` method or `+` operator with two query instances. For a
 union all, use ``Query.union_all()`` or the `*` operator.
@@ -675,6 +676,30 @@ To create a except query, use the ``Query.except_of()`` method.
 .. code-block:: sql
 
     SELECT "created_time","foo","bar" FROM "provider_a" EXCEPT SELECT "created_time","fiz","buz" FROM "provider_b"
+
+Output column contracts
+"""""""""""""""""""""""
+
+Every query and set operation exposes an inspectable ``output_columns`` contract describing the columns it
+produces. Ordinary projections report their count and output names (the explicit alias when one is set, otherwise
+the field name or the rendered expression). Projections containing ``*`` or ``table.*`` cannot be expanded
+statically, so their contract stays ``UNKNOWN`` instead of guessing names. A set operation takes its output names
+from its first (left-most) branch, matching SQL semantics.
+
+.. code-block:: python
+
+    provider_a, provider_b = Tables('provider_a', 'provider_b')
+    q = Query.from_(provider_a).select(provider_a.created_time.as_("t"), provider_a.foo)
+    unioned = q.union(Query.from_(provider_b).select(provider_b.created_time, provider_b.fiz))
+
+    unioned.output_columns.names  # ('t', 'foo')
+    Query.from_(provider_a).select("*").output_columns.known  # False
+
+The contract constrains composition and outer references without executing any database query. Combining branches
+with different column counts raises ``SetOperationException`` immediately, and an outer ``ORDER BY`` on a set
+operation may only reference the set's own output names or 1-based positions - an alias that only exists in a
+non-first branch is rejected instead of silently mis-sorting. Duplicate output names are kept per position, so
+positional ``ORDER BY`` remains unambiguous.
 
 Date, Time, and Intervals
 """""""""""""""""""""""""

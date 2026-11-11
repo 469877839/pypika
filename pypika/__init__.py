@@ -6,6 +6,12 @@ pypika.analytics
 
 Wrappers for SQL analytic functions
 
+pypika.contracts
+----------------
+
+Output column contracts describing the columns a query produces, used to validate set operations and
+outer references without executing a database query.
+
 pypika.dialects
 ---------------
 
@@ -56,6 +62,13 @@ from pypika.dialects import (
     RedshiftQuery,
     SQLLiteQuery,
     VerticaQuery,
+)
+
+# noinspection PyUnresolvedReferences
+from pypika.contracts import (
+    OutputColumn,
+    OutputColumnContract,
+    UNKNOWN,
 )
 
 # noinspection PyUnresolvedReferences
@@ -139,6 +152,9 @@ __all__ = (
     'DatePart',
     'JoinType',
     'Order',
+    'OutputColumn',
+    'OutputColumnContract',
+    'UNKNOWN',
     'AliasedQuery',
     'Query',
     'Schema',

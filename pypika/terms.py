@@ -62,6 +62,17 @@ class Term(Node):
     def as_(self, alias: str) -> None:
         self.alias = alias
 
+    def output_name(self, quote_char: str | None = None) -> str:
+        """
+        Returns the name this term contributes when used as an unaliased projection.
+
+        The alias wins when one is set; otherwise the term's rendered SQL without an alias is used,
+        matching the name the database exposes for an unaliased expression.
+        """
+        if self.alias is not None:
+            return self.alias
+        return self.get_sql(quote_char=quote_char)
+
     @property
     def tables_(self) -> set[Table]:
         from pypika import Table
@@ -785,6 +796,11 @@ class Field(Criterion, JSON):
             return format_alias_sql(field_sql, field_alias, quote_char=quote_char, **kwargs)
         return field_sql
 
+    def output_name(self, quote_char: str | None = None) -> str:
+        if self.alias is not None:
+            return self.alias
+        return self.name
+
 
 class Index(Term):
     def __init__(self, name: str, alias: str | None = None) -> None:
@@ -812,6 +828,9 @@ class Star(Field):
             return "{}.*".format(format_quotes(namespace, quote_char))
 
         return "*"
+
+    def output_name(self, quote_char: str | None = None) -> str | None:
+        return None
 
 
 class Tuple(Criterion):
