@@ -105,6 +105,7 @@ from pypika.terms import (
     Rollup,
     SystemTimeValue,
     Tuple,
+    Window,
 )
 
 # noinspection PyUnresolvedReferences
@@ -116,6 +117,7 @@ from pypika.utils import (
     QueryException,
     RollupException,
     SetOperationException,
+    WindowException,
 )
 
 __author__ = "Timothy Heys"
@@ -169,6 +171,7 @@ __all__ = (
     'Rollup',
     'Tuple',
     'CustomFunction',
+    'Window',
     'CaseException',
     'GroupingException',
     'JiraQuery',
@@ -177,6 +180,7 @@ __all__ = (
     'RollupException',
     'SetOperationException',
     'FunctionException',
+    'WindowException',
     'NULL',
     'SYSTEM_TIME',
 )

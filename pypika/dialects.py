@@ -384,6 +384,8 @@ class OracleQuery(Query):
 class OracleQueryBuilder(FetchNextAndOffsetRowsQueryBuilder):
     QUOTE_CHAR = None
     QUERY_CLS = OracleQuery
+    # Oracle has no WINDOW clause, so named windows are expanded into each analytic function instead.
+    supports_named_windows = False
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(dialect=Dialects.ORACLE, **kwargs)
@@ -702,6 +704,8 @@ class MSSQLQuery(Query):
 
 class MSSQLQueryBuilder(FetchNextAndOffsetRowsQueryBuilder):
     QUERY_CLS = MSSQLQuery
+    # T-SQL has no WINDOW clause, so named windows are expanded into each analytic function instead.
+    supports_named_windows = False
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(dialect=Dialects.MSSQL, **kwargs)
@@ -1013,6 +1017,8 @@ class JiraQueryBuilder(QueryBuilder):
     QUOTE_CHAR = ""
     SECONDARY_QUOTE_CHAR = '"'
     QUERY_CLS = JiraQuery
+    # JQL has no WINDOW clause, so named windows are expanded into each analytic function instead.
+    supports_named_windows = False
 
     def __init__(self, **kwargs) -> None:
         super().__init__(dialect=Dialects.JIRA, **kwargs)

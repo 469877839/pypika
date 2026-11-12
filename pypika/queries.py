@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 from pypika.enums import Dialects, JoinType, ReferenceOption, SetOperation
 from pypika.terms import (
+    AnalyticFunction,
     ArithmeticExpression,
     Criterion,
     EmptyCriterion,
@@ -21,12 +22,14 @@ from pypika.terms import (
     Term,
     Tuple,
     ValueWrapper,
+    Window,
 )
 from pypika.utils import (
     JoinException,
     QueryException,
     RollupException,
     SetOperationException,
+    WindowException,
     builder,
     format_alias_sql,
     format_quotes,
@@ -758,6 +761,7 @@ class QueryBuilder(Selectable, Term):
     ALIAS_QUOTE_CHAR = None
     QUERY_ALIAS_QUOTE_CHAR = None
     QUERY_CLS = Query
+    supports_named_windows = True
 
     def __init__(
         self,
@@ -777,6 +781,7 @@ class QueryBuilder(Selectable, Term):
 
         self._with = []
         self._selects = []
+        self._windows = []
         self._force_indexes = []
         self._use_indexes = []
         self._columns = []
@@ -825,6 +830,7 @@ class QueryBuilder(Selectable, Term):
         newone._from = copy(self._from)
         newone._with = copy(self._with)
         newone._selects = copy(self._selects)
+        newone._windows = copy(self._windows)
         newone._columns = copy(self._columns)
         newone._values = copy(self._values)
         newone._groupbys = copy(self._groupbys)
@@ -882,6 +888,7 @@ class QueryBuilder(Selectable, Term):
 
         self._with = [alias_query.replace_table(current_table, new_table) for alias_query in self._with]
         self._selects = [select.replace_table(current_table, new_table) for select in self._selects]
+        self._windows = [named_window.replace_table(current_table, new_table) for named_window in self._windows]
         self._columns = [column.replace_table(current_table, new_table) for column in self._columns]
         self._values = [
             [value.replace_table(current_table, new_table) for value in value_list] for value_list in self._values
@@ -927,6 +934,45 @@ class QueryBuilder(Selectable, Term):
                 self._select_other(term)
             else:
                 self._select_other(self.wrap_constant(term, wrapper_cls=self._wrapper_cls))
+
+    @builder
+    def window(
+        self,
+        name: str,
+        *,
+        base: str | None = None,
+        partition: Sequence[Any] | None = None,
+        orderby: Sequence[Any] | None = None,
+        frame: str | None = None,
+        bound: Any = None,
+    ) -> None:
+        """
+        Defines a named window for this SELECT query.  Analytic functions reference it with
+        ``AnalyticFunction.over(window=name)``.  The name is scoped to this SELECT; subqueries may define their own
+        window with the same name.
+
+        :param name:
+            The window name, referenced from analytic functions and from child windows.
+        :param base:
+            Name of a window defined in the same SELECT to inherit from.  The child inherits the base's PARTITION BY
+            and, unless specified here, its ORDER BY and frame clauses.
+        :param partition:
+            PARTITION BY terms.  Cannot be combined with ``base``.
+        :param orderby:
+            ORDER BY terms; each item is a term or a ``(term, Order)`` tuple.  Cannot be combined with ``base`` when
+            the base window already defines an ORDER BY clause.
+        :param frame:
+            Frame mode, ``"ROWS"`` or ``"RANGE"``.  Cannot be combined with ``base`` when the base window already
+            defines a frame clause.
+        :param bound:
+            Frame bounds, e.g. ``analytics.Preceding()`` or a ``(lower, upper)`` pair.
+        """
+        if any(named_window.name == name for named_window in self._windows):
+            raise WindowException(f"Window '{name}' is already defined in this SELECT")
+
+        self._windows.append(
+            Window(name, base=base, partition=partition, orderby=orderby, frame=frame, bound=bound)
+        )
 
     @builder
     def delete(self) -> None:
@@ -1317,6 +1363,9 @@ class QueryBuilder(Selectable, Term):
         if self._update_table and not self._updates:
             return ""
 
+        if self._windows or self._uses_named_windows():
+            self._resolve_windows(kwargs)
+
         has_joins = bool(self._joins)
         has_multiple_from_clauses = 1 < len(self._from)
         has_subquery_from_clause = 0 < len(self._from) and isinstance(self._from[0], QueryBuilder)
@@ -1416,6 +1465,9 @@ class QueryBuilder(Selectable, Term):
         if self._qualifys:
             querystring += self._qualify_sql(**kwargs)
 
+        if self._windows and not kwargs.get("expand_windows"):
+            querystring += self._window_sql(**kwargs)
+
         if self._orderbys:
             querystring += self._orderby_sql(**kwargs)
 
@@ -1449,6 +1501,88 @@ class QueryBuilder(Selectable, Term):
             clause.name + " AS (" + clause.get_sql(subquery=False, with_alias=False, **kwargs) + ") "
             for clause in self._with
         )
+
+    def _analytic_functions(self) -> list[AnalyticFunction]:
+        functions = []
+        for term in self._selects:
+            functions.extend(term.find_(AnalyticFunction))
+        for term, _ in self._orderbys:
+            functions.extend(term.find_(AnalyticFunction))
+        if self._qualifys is not None:
+            functions.extend(self._qualifys.find_(AnalyticFunction))
+        return functions
+
+    def _uses_named_windows(self) -> bool:
+        return any(function._window is not None for function in self._analytic_functions())
+
+    def _resolve_windows(self, kwargs: dict) -> dict[str, Window]:
+        """
+        Validates every named window belonging to this SELECT and links child windows to their base.  Checks
+        duplicate names (at definition time), unknown references, cyclic inheritance and the SQL standard
+        restrictions on PARTITION BY, ORDER BY and frame inheritance.  The resolved mapping is returned and also
+        injected into ``kwargs`` so analytic functions can resolve their references during rendering.
+        """
+        windows = {}
+        for named_window in self._windows:
+            if named_window.name in windows:
+                raise WindowException(f"Window '{named_window.name}' is already defined in this SELECT")
+            windows[named_window.name] = named_window
+
+        for named_window in self._windows:
+            if named_window.base is None:
+                continue
+            if named_window.base not in windows:
+                raise WindowException(
+                    f"Window '{named_window.name}' references unknown base window '{named_window.base}'"
+                )
+
+        for named_window in self._windows:
+            visited = []
+            current = named_window
+            while current is not None:
+                if current.name in visited:
+                    chain = " -> ".join([*visited[visited.index(current.name):], current.name])
+                    raise WindowException(f"Cyclic window inheritance detected: {chain}")
+                visited.append(current.name)
+                current = windows[current.base] if current.base is not None else None
+
+        for named_window in self._windows:
+            if named_window.base is not None:
+                named_window._base_window = windows[named_window.base]
+            named_window._validate_refinement()
+
+        for function in self._analytic_functions():
+            if function._window is not None and function._window not in windows:
+                raise WindowException(
+                    f"Analytic function references unknown window '{function._window}'; "
+                    "define it with QueryBuilder.window() in the same SELECT"
+                )
+
+        kwargs["windows"] = windows
+        kwargs.setdefault("expand_windows", not self.supports_named_windows)
+        return windows
+
+    def _window_sql(self, **kwargs: Any) -> str:
+        windows = kwargs["windows"]
+        definitions = []
+        emitted = set()
+
+        def emit(named_window: Window) -> None:
+            if named_window.name in emitted:
+                return
+            if named_window.base is not None:
+                emit(windows[named_window.base])
+            emitted.add(named_window.name)
+            definitions.append(
+                "{name} AS ({definition})".format(
+                    name=format_quotes(named_window.name, kwargs.get("quote_char")),
+                    definition=named_window.get_definition_sql(**kwargs),
+                )
+            )
+
+        for named_window in self._windows:
+            emit(named_window)
+        return " WINDOW {definitions}".format(definitions=",".join(definitions))
 
     def _distinct_sql(self, **kwargs: Any) -> str:
         distinct = 'DISTINCT ' if self._distinct else ''

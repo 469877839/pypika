@@ -16,6 +16,7 @@ from pypika.enums import Arithmetic, Boolean, Comparator, Dialects, Equality, JS
 from pypika.utils import (
     CaseException,
     FunctionException,
+    WindowException,
     builder,
     escape_backslashes,
     format_alias_sql,
@@ -1565,7 +1566,13 @@ class Function(Criterion):
         dialect = kwargs.pop("dialect", None)
 
         # FIXME escape
-        function_sql = self.get_function_sql(with_namespace=with_namespace, quote_char=quote_char, dialect=dialect)
+        function_sql = self.get_function_sql(
+            with_namespace=with_namespace,
+            quote_char=quote_char,
+            dialect=dialect,
+            windows=kwargs.get("windows"),
+            expand_windows=kwargs.get("expand_windows"),
+        )
 
         if self.schema is not None:
             function_sql = "{schema}.{function}".format(
@@ -1616,12 +1623,19 @@ class AnalyticFunction(AggregateFunction):
         self._filters = []
         self._partition = []
         self._orderbys = []
+        self._window = None
         self._include_filter = False
         self._include_over = False
 
     @builder
-    def over(self, *terms: Any) -> None:
+    def over(self, *terms: Any, window: str | None = None) -> None:
         self._include_over = True
+        if window is not None:
+            if terms:
+                raise WindowException(
+                    "Analytic function cannot combine a named window with a PARTITION BY clause in its own OVER()"
+                )
+            self._window = window
         self._partition += terms
 
     @builder
@@ -1638,36 +1652,87 @@ class AnalyticFunction(AggregateFunction):
             orient=orient.value,
         )
 
+    def _partition_clause_sql(self, **kwargs: Any) -> str:
+        return "PARTITION BY {args}".format(
+            args=",".join(p.get_sql(**kwargs) if hasattr(p, "get_sql") else str(p) for p in self._partition)
+        )
+
+    def _orderby_clause_sql(self, **kwargs: Any) -> str:
+        return "ORDER BY {orderby}".format(
+            orderby=",".join(self._orderby_field(field, orient, **kwargs) for field, orient in self._orderbys)
+        )
+
     def get_partition_sql(self, **kwargs: Any) -> str:
         terms = []
+        if self._window is not None:
+            terms.append(format_quotes(self._window, kwargs.get("quote_char")))
+
         if self._partition:
-            terms.append(
-                "PARTITION BY {args}".format(
-                    args=",".join(p.get_sql(**kwargs) if hasattr(p, "get_sql") else str(p) for p in self._partition)
-                )
-            )
+            terms.append(self._partition_clause_sql(**kwargs))
 
         if self._orderbys:
-            terms.append(
-                "ORDER BY {orderby}".format(
-                    orderby=",".join(self._orderby_field(field, orient, **kwargs) for field, orient in self._orderbys)
-                )
-            )
+            terms.append(self._orderby_clause_sql(**kwargs))
 
         return " ".join(terms)
 
+    def _validate_named_window_refinement(self, window: Window) -> None:
+        if self._partition:
+            raise WindowException(
+                f"Analytic function referencing window '{self._window}' cannot override its PARTITION BY clause"
+            )
+        if self._orderbys and window.effective_orderby:
+            raise WindowException(
+                f"Analytic function referencing window '{self._window}' cannot override its ORDER BY clause"
+            )
+        if self._has_frame() and window.effective_frame is not None:
+            raise WindowException(
+                f"Analytic function referencing window '{self._window}' cannot override its frame clause"
+            )
+
+    def _has_frame(self) -> bool:
+        return False
+
     def get_function_sql(self, **kwargs: Any) -> str:
         function_sql = super().get_function_sql(**kwargs)
-        partition_sql = self.get_partition_sql(**kwargs)
 
         sql = function_sql
         if self._include_over:
-            sql += f" OVER({partition_sql})"
+            if self._window is not None:
+                windows = kwargs.get("windows") or {}
+                window = windows.get(self._window)
+                if window is None:
+                    raise WindowException(
+                        f"Analytic function references unknown window '{self._window}'; "
+                        "define it with QueryBuilder.window() in the same SELECT"
+                    )
+                self._validate_named_window_refinement(window)
+
+                if kwargs.get("expand_windows"):
+                    sql += f" OVER({window.get_expanded_sql(self, **kwargs)})"
+                elif not (self._partition or self._orderbys or self._has_frame()):
+                    # A bare window name reference; some dialects reject a framed window referenced as OVER(name)
+                    sql += f" OVER {format_quotes(self._window, kwargs.get('quote_char'))}"
+                else:
+                    sql += f" OVER({self.get_partition_sql(**kwargs)})"
+            else:
+                sql += f" OVER({self.get_partition_sql(**kwargs)})"
 
         return sql
 
 
 EdgeT = TypeVar("EdgeT", bound="WindowFrameAnalyticFunction.Edge")
+
+
+def _render_frame_sql(frame: str, bound: Any) -> str:
+    if not isinstance(bound, tuple):
+        return "{frame} {bound}".format(frame=frame, bound=bound)
+
+    lower, upper = bound
+    return "{frame} BETWEEN {lower} AND {upper}".format(
+        frame=frame,
+        lower=lower,
+        upper=upper,
+    )
 
 
 class WindowFrameAnalyticFunction(AnalyticFunction):
@@ -1686,6 +1751,9 @@ class WindowFrameAnalyticFunction(AnalyticFunction):
         self.frame = None
         self.bound = None
 
+    def _has_frame(self) -> bool:
+        return bool(self.frame or self.bound)
+
     def _set_frame_and_bounds(self, frame: str, bound: str, and_bound: EdgeT | None) -> None:
         if self.frame or self.bound:
             raise AttributeError()
@@ -1702,20 +1770,12 @@ class WindowFrameAnalyticFunction(AnalyticFunction):
         self._set_frame_and_bounds("RANGE", bound, and_bound)
 
     def get_frame_sql(self) -> str:
-        if not isinstance(self.bound, tuple):
-            return "{frame} {bound}".format(frame=self.frame, bound=self.bound)
-
-        lower, upper = self.bound
-        return "{frame} BETWEEN {lower} AND {upper}".format(
-            frame=self.frame,
-            lower=lower,
-            upper=upper,
-        )
+        return _render_frame_sql(self.frame, self.bound)
 
     def get_partition_sql(self, **kwargs: Any) -> str:
         partition_sql = super().get_partition_sql(**kwargs)
 
-        if not self.frame and not self.bound:
+        if not self._has_frame():
             return partition_sql
 
         return "{over} {frame}".format(over=partition_sql, frame=self.get_frame_sql())
@@ -1736,6 +1796,152 @@ class IgnoreNullsAnalyticFunction(AnalyticFunction):
 
         # No special params unless ignoring nulls
         return None
+
+
+class Window(Node):
+    """
+    A named window definition belonging to a single SELECT query.
+
+    A window may extend another window defined in the same SELECT via ``base``.  The SQL standard restricts how a
+    child window may refine its parent: the PARTITION BY clause is always inherited and cannot be overridden,
+    ORDER BY may only be specified when the parent does not define one, and the frame clause may only be specified
+    when the parent does not define one.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        base: str | None = None,
+        partition: Sequence[Any] | None = None,
+        orderby: Sequence[Any] | None = None,
+        frame: str | None = None,
+        bound: Any = None,
+    ) -> None:
+        if frame is None and bound is not None:
+            raise WindowException("Window frame bounds require a frame mode ('ROWS' or 'RANGE')")
+        if frame is not None and bound is None:
+            raise WindowException("Window frame mode requires frame bounds")
+        if frame is not None and frame.upper() not in ("ROWS", "RANGE"):
+            raise WindowException(f"Unsupported window frame mode '{frame}'")
+
+        self.name = name
+        self.base = base
+        self.partition = list(partition) if partition else []
+        self.orderby = [item if isinstance(item, tuple) else (item, None) for item in orderby] if orderby else []
+        self.frame = frame.upper() if frame else None
+        self.bound = bound
+
+        self._base_window: Window | None = None
+
+    def nodes_(self) -> Iterator[NodeT]:
+        yield self
+        for term in self.partition:
+            if hasattr(term, "nodes_"):
+                yield from term.nodes_()
+        for term, _ in self.orderby:
+            if hasattr(term, "nodes_"):
+                yield from term.nodes_()
+
+    @builder
+    def replace_table(self, current_table: Table | None, new_table: Table | None) -> None:
+        self.partition = [
+            term.replace_table(current_table, new_table) if hasattr(term, "replace_table") else term
+            for term in self.partition
+        ]
+        self.orderby = [
+            (term.replace_table(current_table, new_table) if hasattr(term, "replace_table") else term, orient)
+            for term, orient in self.orderby
+        ]
+
+    @property
+    def effective_partition(self) -> list:
+        if self.base is not None:
+            return self._base_window.effective_partition
+        return self.partition
+
+    @property
+    def effective_orderby(self) -> list:
+        if self.orderby:
+            return self.orderby
+        if self.base is not None:
+            return self._base_window.effective_orderby
+        return []
+
+    @property
+    def effective_frame(self) -> tuple[str, Any] | None:
+        if self.frame is not None:
+            return (self.frame, self.bound)
+        if self.base is not None:
+            return self._base_window.effective_frame
+        return None
+
+    def _validate_refinement(self) -> None:
+        if self.base is None:
+            return
+
+        if self.partition:
+            raise WindowException(
+                f"Window '{self.name}' cannot override the PARTITION BY clause of its base window '{self.base}'"
+            )
+        if self.orderby and self._base_window.effective_orderby:
+            raise WindowException(
+                f"Window '{self.name}' cannot override the ORDER BY clause of its base window '{self.base}'"
+            )
+        if self.frame is not None and self._base_window.effective_frame is not None:
+            raise WindowException(
+                f"Window '{self.name}' cannot override the frame clause of its base window '{self.base}'"
+            )
+
+    def _partition_clause_sql(self, terms: list, **kwargs: Any) -> str:
+        return "PARTITION BY {args}".format(
+            args=",".join(p.get_sql(**kwargs) if hasattr(p, "get_sql") else str(p) for p in terms)
+        )
+
+    def _orderby_clause_sql(self, orderbys: list, **kwargs: Any) -> str:
+        return "ORDER BY {orderby}".format(
+            orderby=",".join(
+                "{field} {orient}".format(field=field.get_sql(**kwargs), orient=orient.value)
+                if orient is not None
+                else field.get_sql(**kwargs)
+                for field, orient in orderbys
+            )
+        )
+
+    def get_definition_sql(self, **kwargs: Any) -> str:
+        """The window definition as it appears in the WINDOW clause, without the leading ``name AS``."""
+        terms = []
+        if self.base is not None:
+            terms.append(format_quotes(self.base, kwargs.get("quote_char")))
+        if self.partition:
+            terms.append(self._partition_clause_sql(self.partition, **kwargs))
+        if self.orderby:
+            terms.append(self._orderby_clause_sql(self.orderby, **kwargs))
+        if self.frame is not None:
+            terms.append(_render_frame_sql(self.frame, self.bound))
+        return " ".join(terms)
+
+    def get_expanded_sql(self, analytic_function: AnalyticFunction, **kwargs: Any) -> str:
+        """
+        The fully resolved window specification for ``analytic_function`` with all inherited clauses inlined.  Used
+        for dialects without native named window support so no unbound window reference is emitted.
+        """
+        terms = []
+        partition = self.effective_partition
+        if partition:
+            terms.append(self._partition_clause_sql(partition, **kwargs))
+
+        orderby = analytic_function._orderbys or self.effective_orderby
+        if orderby:
+            terms.append(self._orderby_clause_sql(orderby, **kwargs))
+
+        if analytic_function._has_frame():
+            terms.append(analytic_function.get_frame_sql())
+        else:
+            frame = self.effective_frame
+            if frame is not None:
+                terms.append(_render_frame_sql(*frame))
+
+        return " ".join(terms)
 
 
 class Interval(Term):

@@ -1217,6 +1217,58 @@ Unbounded ranges use ``an.Preceding()`` or ``an.Following()`` without arguments.
 
     SELECT "date","amount",SUM("amount") OVER(PARTITION BY "account_id" ORDER BY "date" ROWS BETWEEN 7 PRECEDING AND CURRENT ROW) "rolling_7_day" FROM "transactions"
 
+Named Windows
+"""""""""""""
+
+When several analytic functions share the same window, define it once with ``window()`` and reference it with
+``over(window=name)``. Windows belong to a single ``SELECT``; subqueries may define their own windows with the same
+name. A window can extend another window in the same ``SELECT`` using ``base``.
+
+.. code-block:: python
+
+    from pypika import Query, Table, analytics as an
+
+    t = Table('events')
+    q = (
+        Query.from_(t)
+        .window('by_user', partition=[t.user_id])
+        .window('by_user_by_date', base='by_user', orderby=[t.created_at])
+        .window('running', base='by_user_by_date', frame='ROWS', bound=an.Preceding())
+        .select(
+            t.user_id,
+            an.Rank().over(window='by_user_by_date').as_('rank'),
+            an.Sum(t.amount).over(window='running').as_('running_total'),
+        )
+    )
+
+.. code-block:: sql
+
+    SELECT "user_id",RANK() OVER "by_user_by_date" "rank",SUM("amount") OVER "running" "running_total" FROM "events" WINDOW "by_user" AS (PARTITION BY "user_id"),"by_user_by_date" AS ("by_user" ORDER BY "created_at"),"running" AS ("by_user_by_date" ROWS UNBOUNDED PRECEDING)
+
+A child window inherits the base's ``PARTITION BY`` clause and the base's ``ORDER BY`` and frame clauses when it does
+not define them itself. The SQL standard forbids overriding an inherited clause, so PyPika raises a ``WindowException``
+naming the offending window when a child redefines a parent's ``PARTITION BY``, ``ORDER BY`` or frame. An analytic
+function may only refine a referenced window with an ``ORDER BY`` or frame when the window (including inherited
+clauses) does not already define one. Duplicate names, unknown references and cyclic inheritance are reported before
+the final SQL is generated.
+
+Dialects without a native ``WINDOW`` clause (MSSQL, Oracle and JQL) expand each reference into the fully resolved
+window specification, so no unbound window name is emitted:
+
+.. code-block:: python
+
+    from pypika.dialects import MSSQLQuery
+
+    q = (
+        MSSQLQuery.from_(t)
+        .window('by_user', partition=[t.user_id])
+        .select(an.Rank().over(window='by_user').as_('rank'))
+    )
+
+.. code-block:: sql
+
+    SELECT RANK() OVER(PARTITION BY "user_id") "rank" FROM "events"
+
 
 Parametrized Queries
 ^^^^^^^^^^^^^^^^^^^^
