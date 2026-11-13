@@ -6,7 +6,7 @@ from copy import copy
 from functools import reduce
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
-from pypika.enums import Dialects, JoinType, ReferenceOption, SetOperation
+from pypika.enums import Dialects, JoinType, Nulls, Order, ReferenceOption, SetOperation
 from pypika.terms import (
     ArithmeticExpression,
     Criterion,
@@ -15,6 +15,7 @@ from pypika.terms import (
     Function,
     Index,
     Node,
+    NullValue,
     PeriodCriterion,
     Rollup,
     Star,
@@ -624,6 +625,9 @@ class _SetOperation(Selectable, Term):
 
             self._orderbys.append((field, kwargs.get("order")))
 
+    def seek_after(self, *values: Any, **kwargs: Any) -> None:
+        raise QueryException("seek_after is only supported for ordinary SELECT queries")
+
     @builder
     def limit(self, limit: int) -> None:
         self._limit = limit
@@ -793,6 +797,7 @@ class QueryBuilder(Selectable, Term):
         self._havings = None
         self._qualifys = None
         self._orderbys = []
+        self._seek_values = None
         self._joins = []
         self._unions = []
         self._using = []
@@ -829,6 +834,7 @@ class QueryBuilder(Selectable, Term):
         newone._values = copy(self._values)
         newone._groupbys = copy(self._groupbys)
         newone._orderbys = copy(self._orderbys)
+        newone._seek_values = copy(self._seek_values) if self._seek_values is not None else None
         newone._joins = copy(self._joins)
         newone._unions = copy(self._unions)
         newone._updates = copy(self._updates)
@@ -893,7 +899,13 @@ class QueryBuilder(Selectable, Term):
         self._havings = self._havings.replace_table(current_table, new_table) if self._havings else None
         self._qualifys = self._qualifys.replace_table(current_table, new_table) if self._qualifys else None
         self._orderbys = [
-            (orderby[0].replace_table(current_table, new_table), orderby[1]) for orderby in self._orderbys
+            (
+                orderby[0].replace_table(current_table, new_table),
+                orderby[1],
+                orderby[2],
+                orderby[3],
+            )
+            for orderby in self._orderbys
         ]
         self._joins = [join.replace_table(current_table, new_table) for join in self._joins]
 
@@ -1078,10 +1090,173 @@ class QueryBuilder(Selectable, Term):
 
     @builder
     def orderby(self, *fields: Any, **kwargs: Any) -> None:
+        order = kwargs.get("order")
+        nulls = kwargs.get("nulls")
+        unique = kwargs.get("unique", False)
+
+        if nulls is not None and not isinstance(nulls, Nulls):
+            raise QueryException("orderby nulls must be a Nulls enum value")
+        if not isinstance(unique, bool):
+            raise QueryException("orderby unique must be a boolean")
+
         for field in fields:
             field = Field(field, table=self._from[0]) if isinstance(field, str) else self.wrap_constant(field)
 
-            self._orderbys.append((field, kwargs.get("order")))
+            self._orderbys.append((field, order, nulls, unique))
+
+    @builder
+    def seek_after(self, *values: Any, **kwargs: Any) -> None:
+        """
+        Restrict the query to rows that sort after a cursor row.
+
+        The ordering must already be described with ``orderby``. Every ordering
+        term needs an explicit ``nulls=Nulls.first`` or ``nulls=Nulls.last``,
+        and the final term must be declared ``unique=True`` (or passed as
+        ``unique_key``). Cursor values are positional and must match the number
+        of ordering terms. ``Parameter`` values are supported for binding.
+        """
+        unknown_kwargs = set(kwargs) - {"values", "unique", "unique_key"}
+        if unknown_kwargs:
+            raise TypeError("Unexpected keyword argument(s): %s" % ", ".join(sorted(unknown_kwargs)))
+
+        if "values" in kwargs:
+            if values:
+                raise QueryException("Pass cursor values either positionally or with values=, not both")
+            values = tuple(kwargs["values"])
+        elif len(values) == 1 and isinstance(values[0], (list, tuple)):
+            values = tuple(values[0])
+
+        unique = kwargs.get("unique", False)
+        if not isinstance(unique, bool):
+            raise QueryException("seek_after unique must be a boolean")
+        if unique:
+            self._mark_unique_seek_tail()
+
+        unique_key = kwargs.get("unique_key")
+        if unique_key is not None:
+            self._mark_unique_seek_tail(unique_key)
+
+        cursor_values = [self._wrap_cursor_value(value) for value in values]
+        self._validate_seek(cursor_values)
+        self._seek_values = cursor_values
+
+    def _mark_unique_seek_tail(self, unique_key: Any = None) -> None:
+        if not self._orderbys:
+            raise QueryException("seek_after requires at least one orderby term")
+
+        if unique_key is not None:
+            if isinstance(unique_key, str):
+                unique_key = Field(unique_key, table=self._from[0])
+            tail_field = self._resolve_orderby_field(self._orderbys[-1][0])
+            if not self._same_field(tail_field, unique_key):
+                raise QueryException("unique_key must match the final orderby field")
+
+        field, order, nulls, _ = self._orderbys[-1]
+        self._orderbys[-1] = (field, order, nulls, True)
+
+    def _wrap_cursor_value(self, value: Any) -> Term:
+        if isinstance(value, Term):
+            return value
+        return self.wrap_constant(value, wrapper_cls=self._wrapper_cls)
+
+    @staticmethod
+    def _same_field(left: Any, right: Any) -> bool:
+        return (
+            isinstance(left, Field)
+            and isinstance(right, Field)
+            and left.name == right.name
+            and left.table == right.table
+        )
+
+    def _resolve_orderby_field(self, field: Any) -> Field:
+        selected_aliases = {select.alias: select for select in self._selects if select.alias}
+        alias = getattr(field, "alias", None)
+        if alias in selected_aliases:
+            field = selected_aliases[alias]
+        elif isinstance(field, Field) and field.name in selected_aliases:
+            field = selected_aliases[field.name]
+        return field
+
+    def _validate_seek(self, cursor_values: Sequence[Any]) -> None:
+        if not (
+            self._selects
+            and not self._insert_table
+            and not self._update_table
+            and not self._delete_from
+            and not self._select_into
+        ):
+            raise QueryException("seek_after is only supported for ordinary SELECT queries")
+
+        if self._groupbys or self._havings or self._qualifys:
+            raise QueryException("seek_after does not support grouping, HAVING, or QUALIFY")
+
+        if not self._orderbys:
+            raise QueryException("seek_after requires at least one orderby term")
+
+        if len(cursor_values) != len(self._orderbys):
+            raise QueryException(
+                "seek_after expected %d cursor value(s), got %d" % (len(self._orderbys), len(cursor_values))
+            )
+
+        for cursor_value in cursor_values:
+            if cursor_value.fields_():
+                raise QueryException("seek_after cursor values must be literal or parameter values, not fields")
+
+        source_tables = self._from + [join.item for join in self._joins]
+        for field, _, nulls, _ in self._orderbys:
+            if nulls is None:
+                raise QueryException("Every seek_after orderby term must specify nulls=Nulls.first or Nulls.last")
+            if not isinstance(nulls, Nulls):
+                raise QueryException("orderby nulls must be a Nulls enum value")
+
+            field = self._resolve_orderby_field(field)
+            if not isinstance(field, Field) or isinstance(field, Star):
+                raise QueryException(
+                    "seek_after only supports plain column orderby terms; "
+                    "aggregate, function, and computed expressions are not supported"
+                )
+            if field.table is None or field.table not in source_tables:
+                raise QueryException("seek_after orderby field %s does not belong to the query source" % field.name)
+
+        if not self._orderbys[-1][3]:
+            raise QueryException("The final seek_after orderby term must be unique=True")
+
+        if isinstance(cursor_values[-1], NullValue):
+            raise QueryException("The unique final seek_after cursor value cannot be NULL")
+
+    def _seek_criterion(self) -> Criterion:
+        self._validate_seek(self._seek_values)
+
+        prefix = []
+        branches = []
+        for index, (field, order, nulls, _) in enumerate(self._orderbys):
+            field = self._resolve_orderby_field(field)
+            cursor_value = self._seek_values[index]
+
+            boundary = self._seek_boundary(field, order, nulls, cursor_value)
+            if boundary is not None:
+                branches.append(Criterion.all(prefix) & boundary)
+
+            prefix.append(field.isnull() if isinstance(cursor_value, NullValue) else field == cursor_value)
+
+        return Criterion.any(branches)
+
+    @staticmethod
+    def _seek_boundary(field: Field, order: Order | None, nulls: Nulls, cursor_value: Term) -> Criterion | None:
+        if isinstance(cursor_value, NullValue):
+            return field.isnotnull() if nulls is Nulls.first else None
+
+        boundary = field > cursor_value if order in (None, Order.asc) else field < cursor_value
+        if nulls is Nulls.last:
+            boundary = boundary | field.isnull()
+        return boundary
+
+    def _where_criterion(self) -> Criterion | None:
+        if self._seek_values is None:
+            return self._wheres
+
+        seek_criterion = self._seek_criterion()
+        return seek_criterion if self._wheres is None else self._wheres & seek_criterion
 
     @builder
     def join(
@@ -1402,7 +1577,7 @@ class QueryBuilder(Selectable, Term):
         if self._prewheres:
             querystring += self._prewhere_sql(**kwargs)
 
-        if self._wheres:
+        if self._wheres or self._seek_values is not None:
             querystring += self._where_sql(**kwargs)
 
         if self._groupbys:
@@ -1532,7 +1707,9 @@ class QueryBuilder(Selectable, Term):
         )
 
     def _where_sql(self, quote_char: str | None = None, **kwargs: Any) -> str:
-        return " WHERE {where}".format(where=self._wheres.get_sql(quote_char=quote_char, subquery=True, **kwargs))
+        return " WHERE {where}".format(
+            where=self._where_criterion().get_sql(quote_char=quote_char, subquery=True, **kwargs)
+        )
 
     def _group_sql(
         self,
@@ -1584,16 +1761,19 @@ class QueryBuilder(Selectable, Term):
         """
         clauses = []
         selected_aliases = {s.alias for s in self._selects}
-        for field, directionality in self._orderbys:
+        for field, directionality, nulls, _ in self._orderbys:
             term = (
                 format_quotes(field.alias, alias_quote_char or quote_char)
                 if orderby_alias and field.alias and field.alias in selected_aliases
                 else field.get_sql(quote_char=quote_char, alias_quote_char=alias_quote_char, **kwargs)
             )
 
-            clauses.append(
-                "{term} {orient}".format(term=term, orient=directionality.value) if directionality is not None else term
-            )
+            clause = term
+            if directionality is not None:
+                clause += " {orient}".format(orient=directionality.value)
+            if nulls is not None:
+                clause += " NULLS {nulls}".format(nulls=nulls.value)
+            clauses.append(clause)
 
         return " ORDER BY {orderby}".format(orderby=",".join(clauses))
 

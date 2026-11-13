@@ -166,6 +166,33 @@ This results in the following SQL:
 
     SELECT "id","fname","lname","phone" FROM "customers" ORDER BY "id" DESC
 
+Cursor Pagination
+"""""""""""""""""
+
+``seek_after`` turns an ordered query into a keyset-paginated query. It reuses the existing ``orderby`` terms and
+generates a null-aware lexicographic condition, so the original ``WHERE`` clause is preserved on the returned query.
+Every ordering term must declare whether NULLs sort first or last, and the final term must be a unique tiebreaker.
+
+.. code-block:: python
+
+    from pypika import Nulls, Order, Query, Table
+
+    events = Table("events")
+    base = (
+        Query.from_(events)
+        .select(events.id, events.category, events.score)
+        .where(events.active == True)
+        .orderby(events.category, order=Order.asc, nulls=Nulls.first)
+        .orderby(events.score, order=Order.desc, nulls=Nulls.last)
+        .orderby(events.id, order=Order.asc, nulls=Nulls.last, unique=True)
+    )
+    page = base.seek_after("A", 10, 42).limit(25)
+
+The cursor values are positional and must match the number of ``orderby`` terms. Plain cursor values are rendered as
+SQL literals by default; pass ``parameter=QmarkParameter()`` to ``get_sql`` to bind them instead. ``seek_after`` is
+currently limited to plain columns in ordinary SELECT queries. Aggregate, random, function, and computed ordering
+expressions are rejected, as are missing NULL placement and a non-unique final ordering term.
+
 Arithmetic
 """"""""""
 

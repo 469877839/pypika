@@ -55,6 +55,11 @@ class Order(Enum):
     desc = "DESC"
 
 
+class Nulls(Enum):
+    first = "FIRST"
+    last = "LAST"
+
+
 class JoinType(Enum):
     inner = ""
     left = "LEFT"
