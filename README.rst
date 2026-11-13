@@ -599,6 +599,33 @@ union all, use ``Query.union_all()`` or the `*` operator.
 
     SELECT "created_time","foo","bar" FROM "provider_a" UNION SELECT "created_time","fiz","buz" FROM "provider_b"
 
+Output column contracts
+"""""""""""""""""""""""
+
+Every ``SELECT`` builder and every ``UNION`` / ``INTERSECT`` / ``EXCEPT`` / ``MINUS`` operation exposes an
+``output_columns`` contract.  It describes the ordered output columns without executing a database query.  Set
+operations take their output names from the first branch; duplicate names remain in the sequence.
+
+.. code-block:: python
+
+    q = Query.from_(provider_a).select(
+        provider_a.id.as_('id'), provider_a.label.as_('label')
+    )
+    u = q.union(Query.from_(provider_b).select(provider_b.key, provider_b.description))
+
+    u.output_columns.width      # 2
+    u.output_columns.names      # ('id', 'label')
+    u.output_columns[1].name    # 'label'
+
+``SELECT *`` and other projections which cannot be expanded statically have an unknown width
+(``u.output_columns.width is None``).  Their names are not guessed.  An expression whose position is known but whose
+portable result name is unknown (an unaliased function or literal, for example) has a known width and ``name=None``.
+Use ``validate_output_columns()`` to explicitly check the full set-operation tree.
+
+Known width mismatches are rejected when the contract is inspected or SQL is rendered.  Outer references and
+set-level ``ORDER BY`` clauses may only use names from the contract.  ``ORDER BY`` also accepts a 1-based integer
+position within the known width.  Each branch keeps its own ``ORDER BY`` and ``LIMIT`` inside its parentheses.
+
 Intersect
 """""""""
 

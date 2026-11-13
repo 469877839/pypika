@@ -76,6 +76,203 @@ class Selectable(Node):
         return self.alias
 
 
+class OutputColumn:
+    """A statically known description of one SELECT output column.
+
+    ``name`` is the name visible to an outer query.  It is ``None`` when the
+    expression cannot be assigned a portable SQL output name (for example an
+    unaliased function or literal).
+    """
+
+    __slots__ = ("name", "position", "alias", "source_name")
+
+    def __init__(
+        self,
+        name: str | None,
+        position: int,
+        alias: str | None = None,
+        source_name: str | None = None,
+    ) -> None:
+        self.name = name
+        self.position = position
+        self.alias = alias
+        self.source_name = source_name
+
+    @property
+    def known(self) -> bool:
+        return self.name is not None
+
+    @property
+    def is_known(self) -> bool:
+        return self.known
+
+    def __eq__(self, other: Any) -> bool:
+        return (
+            isinstance(other, OutputColumn)
+            and self.name == other.name
+            and self.position == other.position
+            and self.alias == other.alias
+            and self.source_name == other.source_name
+        )
+
+    def __hash__(self) -> int:
+        return hash((self.name, self.position, self.alias, self.source_name))
+
+    def __repr__(self) -> str:
+        return "OutputColumn(name={!r}, position={!r}, alias={!r}, source_name={!r})".format(
+            self.name,
+            self.position,
+            self.alias,
+            self.source_name,
+        )
+
+
+class ColumnContract:
+    """The output-column shape of a SELECT or set operation.
+
+    A contract with ``columns=None`` means that the column count cannot be
+    determined statically (``SELECT *`` is the common case).  An individual
+    :class:`OutputColumn` may have ``name=None`` when its position is known but
+    its output name is not portable.
+
+    Duplicate output names are preserved; this object intentionally models an
+    ordered sequence, not a mapping.
+    """
+
+    __slots__ = ("_columns",)
+
+    def __init__(self, columns: Sequence[OutputColumn] | None = None) -> None:
+        self._columns = None if columns is None else tuple(columns)
+
+    @classmethod
+    def unknown(cls) -> ColumnContract:
+        return cls(None)
+
+    @property
+    def columns(self) -> tuple[OutputColumn, ...] | None:
+        return self._columns
+
+    @property
+    def width(self) -> int | None:
+        return None if self._columns is None else len(self._columns)
+
+    @property
+    def names(self) -> tuple[str | None, ...] | None:
+        return None if self._columns is None else tuple(column.name for column in self._columns)
+
+    @property
+    def column_names(self) -> tuple[str | None, ...] | None:
+        return self.names
+
+    @property
+    def output_names(self) -> tuple[str | None, ...] | None:
+        return self.names
+
+    @property
+    def known(self) -> bool:
+        return self._columns is not None
+
+    @property
+    def is_known(self) -> bool:
+        return self.known
+
+    @property
+    def is_unknown(self) -> bool:
+        return not self.known
+
+    @property
+    def names_known(self) -> bool:
+        return self._columns is not None and all(column.name is not None for column in self._columns)
+
+    def positions(self, name: str) -> tuple[int, ...]:
+        if self._columns is None:
+            return ()
+        return tuple(column.position for column in self._columns if column.name == name)
+
+    def __len__(self) -> int:
+        if self._columns is None:
+            raise TypeError("the output column count is unknown")
+        return len(self._columns)
+
+    def __iter__(self):
+        return iter(self._columns or ())
+
+    def __getitem__(self, index):
+        if self._columns is None:
+            raise TypeError("the output column count is unknown")
+        return self._columns[index]
+
+    def __eq__(self, other: Any) -> bool:
+        return isinstance(other, ColumnContract) and self._columns == other._columns
+
+    def __hash__(self) -> int:
+        return hash(self._columns)
+
+    def __repr__(self) -> str:
+        if self._columns is None:
+            return "ColumnContract(unknown)"
+        return "ColumnContract(columns={!r})".format(self._columns)
+
+
+def _describe_contract(contract: ColumnContract) -> str:
+    if not contract.known:
+        return "an unknown number of output columns"
+
+    names = ", ".join(
+        "{} ({})".format(column.name if column.name is not None else "<unnamed>", column.position)
+        for column in contract
+    )
+    return "{} output column(s) [{}]".format(contract.width, names)
+
+
+def _require_compatible_contracts(left: ColumnContract, right: ColumnContract) -> None:
+    if left.known and right.known and left.width != right.width:
+        raise SetOperationException(
+            "Set operation column count mismatch: left operand exposes {}; "
+            "right operand exposes {}. Every branch of a set operation must expose "
+            "the same number of output columns.".format(
+                _describe_contract(left),
+                _describe_contract(right),
+            )
+        )
+
+
+def _contract_for(selectable: Any) -> ColumnContract:
+    if isinstance(selectable, (QueryBuilder, _SetOperation)):
+        return selectable._build_output_contract()
+    if isinstance(selectable, AliasedQuery) and selectable.query is not None:
+        return _contract_for(selectable.query)
+    return ColumnContract.unknown()
+
+
+def _output_column_from_term(term: Any, position: int) -> OutputColumn:
+    alias = getattr(term, "alias", None)
+    source_name = term.name if isinstance(term, Field) and not isinstance(term, Star) else None
+    return OutputColumn(
+        name=alias if alias is not None else source_name,
+        position=position,
+        alias=alias,
+        source_name=source_name,
+    )
+
+
+def _validate_set_operation_references(term: Any, context: str) -> None:
+    if term is None or isinstance(term, Star):
+        return
+
+    try:
+        fields = term.fields_()
+    except (AttributeError, TypeError):
+        return
+
+    for field in fields:
+        if isinstance(field, Star):
+            continue
+        table = getattr(field, "table", None)
+        if isinstance(table, _SetOperation):
+            table._validate_output_reference(field.name, context)
+
+
 class AliasedQuery(Selectable):
     def __init__(self, name: str, query: Selectable | None = None) -> None:
         super().__init__(alias=name)
@@ -613,9 +810,112 @@ class _SetOperation(Selectable, Term):
 
         self._wrapper_cls = wrapper_cls
 
+    def __copy__(self) -> _SetOperation:
+        newone = type(self).__new__(type(self))
+        newone.__dict__.update(self.__dict__)
+        newone._set_operation = copy(self._set_operation)
+        newone._orderbys = copy(self._orderbys)
+        return newone
+
+    def _build_output_contract(self) -> ColumnContract:
+        left = _contract_for(self.base_query)
+        rights = []
+
+        for _, operand in self._set_operation:
+            right = _contract_for(operand)
+            rights.append(right)
+            _require_compatible_contracts(left, right)
+
+        known_right_widths = {contract.width for contract in rights if contract.known}
+        if len(known_right_widths) > 1:
+            first_right = next(contract for contract in rights if contract.known)
+            other_right = next(
+                contract for contract in rights if contract.known and contract.width != first_right.width
+            )
+            _require_compatible_contracts(first_right, other_right)
+
+        if left.known and all(contract.known for contract in rights):
+            return left
+
+        return ColumnContract.unknown()
+
+    @property
+    def output_columns(self) -> ColumnContract:
+        return self._build_output_contract()
+
+    @property
+    def column_contract(self) -> ColumnContract:
+        return self._build_output_contract()
+
+    def get_output_columns(self) -> ColumnContract:
+        return self._build_output_contract()
+
+    def get_columns(self) -> ColumnContract:
+        return self._build_output_contract()
+
+    def validate_output_columns(self) -> ColumnContract:
+        contract = self._build_output_contract()
+        for field, _ in self._orderbys:
+            self._validate_orderby_field(field, allow_set_operation_field=False)
+        return contract
+
+    def _validate_output_reference(self, name: str, context: str) -> None:
+        contract = self._build_output_contract()
+        if contract.known and contract.names_known and name not in contract.names:
+            raise SetOperationException(
+                "{} references output column {!r}, but this set operation exposes {}. "
+                "Outer references must use an output name from the first branch, "
+                "not an alias from an arbitrary branch.".format(context, name, _describe_contract(contract))
+            )
+
+    def _validate_orderby_field(self, field: Any, allow_set_operation_field: bool = True) -> None:
+        contract = self._build_output_contract()
+
+        if not contract.known:
+            return
+
+        if isinstance(field, bool):
+            return
+
+        if isinstance(field, int):
+            if field < 1 or field > contract.width:
+                raise SetOperationException(
+                    "ORDER BY position {} is outside the set operation's {} output column(s); "
+                    "valid positions are 1 through {}.".format(field, contract.width, contract.width)
+                )
+            return
+
+        if isinstance(field, str):
+            if contract.names_known and field not in contract.names:
+                raise SetOperationException(
+                    "ORDER BY references output column {!r}, but this set operation exposes {}. "
+                    "Use an output name from the first branch or a 1-based position.".format(
+                        field, _describe_contract(contract)
+                    )
+                )
+            return
+
+        if isinstance(field, Field):
+            # Fields obtained from the set operation itself have historically
+            # been accepted even when they do not name a result column.  Keep
+            # that behaviour for compatibility, but validate aliases coming
+            # from a branch (the case which commonly produces invalid SQL).
+            if allow_set_operation_field and isinstance(field.table, _SetOperation):
+                return
+
+            name = field.alias if field.alias is not None else field.name
+            if contract.names_known and name not in contract.names:
+                raise SetOperationException(
+                    "ORDER BY references output column {!r}, but this set operation exposes {}. "
+                    "A branch-specific alias cannot be used outside the set operation.".format(
+                        name, _describe_contract(contract)
+                    )
+                )
+
     @builder
     def orderby(self, *fields: Field, **kwargs: Any) -> None:
         for field in fields:
+            self._validate_orderby_field(field)
             field = (
                 Field(field, table=self.base_query._from[0])
                 if isinstance(field, str)
@@ -682,12 +982,13 @@ class _SetOperation(Selectable, Term):
                 **kwargs,
             )
 
-            set_operation_selects = (
-                set_operation_query.base_query._selects
-                if isinstance(set_operation_query, _SetOperation)
-                else set_operation_query._selects
-            )
-            if len(self.base_query._selects) != len(set_operation_selects):
+            left_contract = _contract_for(self.base_query)
+            right_contract = _contract_for(set_operation_query)
+            if (
+                left_contract.known
+                and right_contract.known
+                and left_contract.width != right_contract.width
+            ):
                 raise SetOperationException(
                     "Queries must have an equal number of select statements in a set operation."
                     "\n\nMain Query:\n{query1}\n\nSet Operations Query:\n{query2}".format(
@@ -835,6 +1136,38 @@ class QueryBuilder(Selectable, Term):
         newone._force_indexes = copy(self._force_indexes)
         newone._use_indexes = copy(self._use_indexes)
         return newone
+
+    def _build_output_contract(self) -> ColumnContract:
+        if not self._selects or self._insert_table or self._update_table or self._delete_from:
+            return ColumnContract.unknown()
+
+        columns = []
+        for position, term in enumerate(self._selects, start=1):
+            if isinstance(term, Star) or (
+                isinstance(term, Field) and isinstance(term.name, str) and term.name.endswith(".*")
+            ):
+                return ColumnContract.unknown()
+            columns.append(_output_column_from_term(term, position))
+
+        return ColumnContract(columns)
+
+    @property
+    def output_columns(self) -> ColumnContract:
+        return self._build_output_contract()
+
+    @property
+    def column_contract(self) -> ColumnContract:
+        return self._build_output_contract()
+
+    def get_output_columns(self) -> ColumnContract:
+        return self._build_output_contract()
+
+    def get_columns(self) -> ColumnContract:
+        return self._build_output_contract()
+
+    def validate_output_columns(self) -> ColumnContract:
+        self._validate_outer_references()
+        return self._build_output_contract()
 
     @builder
     def from_(self, selectable: Selectable | Query | str) -> None:
@@ -995,6 +1328,7 @@ class QueryBuilder(Selectable, Term):
 
     @builder
     def prewhere(self, criterion: Criterion) -> None:
+        _validate_set_operation_references(criterion, "PREWHERE")
         if not self._validate_table(criterion):
             self._foreign_table = True
 
@@ -1008,6 +1342,7 @@ class QueryBuilder(Selectable, Term):
         if isinstance(criterion, EmptyCriterion):
             return
 
+        _validate_set_operation_references(criterion, "WHERE")
         if not self._validate_table(criterion):
             self._foreign_table = True
 
@@ -1021,6 +1356,7 @@ class QueryBuilder(Selectable, Term):
         if isinstance(criterion, EmptyCriterion):
             return
 
+        _validate_set_operation_references(criterion, "HAVING")
         if self._havings:
             self._havings &= criterion
         else:
@@ -1031,6 +1367,7 @@ class QueryBuilder(Selectable, Term):
         if isinstance(criterion, EmptyCriterion):
             return
 
+        _validate_set_operation_references(criterion, "QUALIFY")
         if self._qualifys:
             self._qualifys &= criterion
         else:
@@ -1044,6 +1381,7 @@ class QueryBuilder(Selectable, Term):
             elif isinstance(term, int):
                 term = Field(str(term), table=self._from[0]).wrap_constant(term)
 
+            _validate_set_operation_references(term, "GROUP BY")
             self._groupbys.append(term)
 
     @builder
@@ -1081,6 +1419,7 @@ class QueryBuilder(Selectable, Term):
         for field in fields:
             field = Field(field, table=self._from[0]) if isinstance(field, str) else self.wrap_constant(field)
 
+            _validate_set_operation_references(field, "ORDER BY")
             self._orderbys.append((field, kwargs.get("order")))
 
     @builder
@@ -1200,6 +1539,8 @@ class QueryBuilder(Selectable, Term):
         self._select_field(Field(term, table=self._from[0]))
 
     def _select_field(self, term: Field) -> None:
+        _validate_set_operation_references(term, "SELECT")
+
         if self._select_star:
             # Do not add select terms after a star is selected
             return
@@ -1217,6 +1558,7 @@ class QueryBuilder(Selectable, Term):
         self._selects.append(term)
 
     def _select_other(self, function: Function) -> None:
+        _validate_set_operation_references(function, "SELECT")
         self._selects.append(function)
 
     def fields_(self) -> list[Field]:
@@ -1308,6 +1650,21 @@ class QueryBuilder(Selectable, Term):
         kwargs.setdefault("as_keyword", self.as_keyword)
         kwargs.setdefault("dialect", self.dialect)
 
+    def _validate_outer_references(self) -> None:
+        for term in self._selects:
+            _validate_set_operation_references(term, "SELECT")
+        for term in self._groupbys:
+            _validate_set_operation_references(term, "GROUP BY")
+        for term, _ in self._orderbys:
+            _validate_set_operation_references(term, "ORDER BY")
+        for term in (self._prewheres, self._wheres, self._havings, self._qualifys):
+            _validate_set_operation_references(term, "outer query")
+        for join in self._joins:
+            criterion = getattr(join, "criterion", None)
+            _validate_set_operation_references(criterion, "JOIN")
+            for field in getattr(join, "fields", ()):
+                _validate_set_operation_references(field, "JOIN USING")
+
     def get_sql(self, with_alias: bool = False, subquery: bool = False, **kwargs: Any) -> str:
         self._set_kwargs_defaults(kwargs)
         if not (self._selects or self._insert_table or self._delete_from or self._update_table):
@@ -1316,6 +1673,8 @@ class QueryBuilder(Selectable, Term):
             return ""
         if self._update_table and not self._updates:
             return ""
+
+        self._validate_outer_references()
 
         has_joins = bool(self._joins)
         has_multiple_from_clauses = 1 < len(self._from)

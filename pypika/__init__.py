@@ -68,8 +68,10 @@ from pypika.enums import (
 # noinspection PyUnresolvedReferences
 from pypika.queries import (
     AliasedQuery,
+    ColumnContract,
     Column,
     Database,
+    OutputColumn,
     Query,
     Schema,
     Table,
@@ -140,6 +142,8 @@ __all__ = (
     'JoinType',
     'Order',
     'AliasedQuery',
+    'ColumnContract',
+    'OutputColumn',
     'Query',
     'Schema',
     'Table',
