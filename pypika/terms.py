@@ -12,6 +12,7 @@ from enum import Enum
 from ipaddress import IPv4Address, IPv6Address
 from typing import TYPE_CHECKING, Any, TypeVar, overload
 
+from pypika.dialect_capabilities import supports_aggregate_filter
 from pypika.enums import Arithmetic, Boolean, Comparator, Dialects, Equality, JSONOperators, Matching, Order
 from pypika.utils import (
     CaseException,
@@ -1582,6 +1583,11 @@ class Function(Criterion):
 class AggregateFunction(Function):
     is_aggregate = True
 
+    # Aggregates for which agg(x) FILTER(WHERE f) has a proven CASE-based
+    # equivalent on dialects without the standard FILTER clause. Rewrites for
+    # anything else cannot be derived generically, so those raise instead.
+    _FILTER_FALLBACK_FUNCTIONS = frozenset({"COUNT", "SUM", "AVG", "MIN", "MAX"})
+
     def __init__(self, name, *args, **kwargs):
         super().__init__(name, *args, **kwargs)
 
@@ -1597,7 +1603,46 @@ class AggregateFunction(Function):
         if self._include_filter:
             return "WHERE {criterions}".format(criterions=Criterion.all(self._filters).get_sql(**kwargs))
 
-    def get_function_sql(self, **kwargs: Any):
+    def _get_filter_criterion(self) -> Any:
+        return Criterion.all(self._filters)
+
+    def _get_filtered_arg_sql(self, **kwargs: Any) -> str:
+        """
+        Renders the CASE-based fallback for dialects without FILTER support.
+
+        The standard clause ``agg(x) FILTER(WHERE f)`` is equivalent to:
+
+        - ``COUNT(*)``       -> ``SUM(CASE WHEN f THEN 1 ELSE 0 END)``
+        - every other agg    -> ``agg(CASE WHEN f THEN x END)``
+
+        Leaving the CASE without an ELSE yields NULL for non-matching rows,
+        which every aggregate except COUNT ignores. A WHERE predicate that
+        evaluates to NULL/UNKNOWN simply fails the WHEN test, matching the
+        three-valued-logic behavior of the native FILTER clause.
+        """
+        if self.name not in self._FILTER_FALLBACK_FUNCTIONS:
+            raise FunctionException(
+                "Aggregate function {name} does not support a semantically equivalent "
+                "fallback for filtered aggregation on this dialect. Only {supported} can "
+                "be rewritten without the FILTER clause.".format(
+                    name=self.name,
+                    supported=", ".join(sorted(self._FILTER_FALLBACK_FUNCTIONS)),
+                )
+            )
+
+        filter_criterion = self._get_filter_criterion()
+
+        if self.name == "COUNT" and self.args and isinstance(self.args[0], Star):
+            filtered_arg = Case().when(filter_criterion, 1).else_(0)
+            return Function("SUM", filtered_arg).get_function_sql(**kwargs)
+
+        filtered_arg = Case().when(filter_criterion, self.args[0])
+        return Function(self.name, filtered_arg).get_function_sql(**kwargs)
+
+    def get_function_sql(self, **kwargs: Any) -> str:
+        if self._include_filter and not supports_aggregate_filter(kwargs.get("dialect")):
+            return self._get_filtered_arg_sql(**kwargs)
+
         sql = super().get_function_sql(**kwargs)
         filter_sql = self.get_filter_sql(**kwargs)
 

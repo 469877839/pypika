@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### New Features
+
+- **Dialect-aware filtered aggregates** - `Count`, `Sum`, `Avg`, `Min` and `Max` (including `COUNT(*)`, `DISTINCT` and window variants) now render the standard `FILTER (WHERE ...)` clause on dialects that support it and a semantically equivalent `CASE`-based fallback on dialects that do not. Dialect capabilities are declared in `pypika/dialect_capabilities.py`; custom aggregates without a proven fallback raise `FunctionException` instead of being rewritten blindly.
+
 ## v0.50.0 (2025-01-14)
 
 ### New Features

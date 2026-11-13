@@ -429,6 +429,47 @@ when you want to filter after window functions have been evaluated.
 
     SELECT * FROM "events" QUALIFY RANK() OVER(PARTITION BY "user_id" ORDER BY "created_at")=1
 
+Filtered Aggregates
+"""""""""""""""""""
+
+The aggregate functions ``COUNT``, ``SUM``, ``AVG``, ``MIN`` and ``MAX`` (including ``COUNT(*)`` and ``DISTINCT``
+variants) expose a unified ``filter()`` interface. A single metric definition can therefore be rendered for databases
+that support the standard SQL:2003 ``FILTER (WHERE ...)`` clause and for databases that do not.
+
+.. code-block:: python
+
+    from pypika import MySQLQuery, SQLLiteQuery, Table
+    from pypika import functions as fn
+
+    orders = Table('orders')
+    revenue = fn.Sum(orders.total).filter(orders.status == 'paid')
+
+    SQLLiteQuery.from_(orders).select(revenue)
+    MySQLQuery.from_(orders).select(revenue)
+
+.. code-block:: sql
+
+    -- Dialects with native FILTER support (PostgreSQL, SQLite, Snowflake)
+    SELECT SUM("total") FILTER(WHERE "status"='paid') FROM "orders"
+
+    -- Dialects without FILTER support (MySQL, Oracle, MSSQL, Redshift, ...)
+    SELECT SUM(CASE WHEN `status`='paid' THEN `total` END) FROM `orders`
+
+The fallback rewrites are only applied where a semantic equivalent exists:
+
+- ``COUNT(*) FILTER(WHERE f)`` becomes ``SUM(CASE WHEN f THEN 1 ELSE 0 END)``.
+- every other supported aggregate becomes ``agg(CASE WHEN f THEN x END)``. Omitting the ``ELSE`` yields ``NULL`` for
+  non-matching rows, which all aggregates except ``COUNT`` ignore, and a predicate that evaluates to ``NULL``/UNKNOWN
+  simply fails the ``WHEN`` test, matching the three-valued-logic behavior of native ``FILTER``.
+- window expressions keep their ``OVER (...)`` clause in both renderings.
+
+Custom or unknown aggregates have no generic equivalent, so on dialects without ``FILTER`` support they raise
+``pypika.utils.FunctionException`` instead of being wrapped in ``CASE`` blindly.
+
+Which dialects support the native clause is declared centrally in
+``pypika/dialect_capabilities.py`` (``supports_aggregate_filter``). Rendering without a concrete dialect keeps the
+historical default of emitting the standard ``FILTER`` clause.
+
 GROUP BY Modifiers
 """"""""""""""""""
 
