@@ -15,7 +15,9 @@ from pypika.terms import (
     Function,
     Index,
     Node,
+    Parameter,
     PeriodCriterion,
+    QmarkParameter,
     Rollup,
     Star,
     Term,
@@ -24,6 +26,7 @@ from pypika.terms import (
 )
 from pypika.utils import (
     JoinException,
+    ParameterException,
     QueryException,
     RollupException,
     SetOperationException,
@@ -1434,6 +1437,60 @@ class QueryBuilder(Selectable, Term):
             return format_alias_sql(querystring, self.alias, **kwargs)
 
         return querystring
+
+    @staticmethod
+    def _new_parameter_collector(parameter: type[Parameter] | Parameter | None) -> Parameter:
+        if parameter is None:
+            return QmarkParameter()
+        if isinstance(parameter, type):
+            return parameter()
+        return parameter.new_collector()
+
+    def get_parameterized_sql(
+        self,
+        parameter: type[Parameter] | Parameter | None = None,
+        strict: bool = True,
+        **kwargs: Any,
+    ) -> tuple[str, list | dict]:
+        """
+        Compile the query once and return ``(sql, parameters)`` together.
+
+        A fresh parameter collector is created for every call, so the collected
+        values live only for this compilation and the reusable query tree is not
+        mutated. Repeated compilations, compilations from multiple threads and
+        expressions referenced several times therefore each get a parameter list
+        or dict matching the placeholders actually rendered in that call. A
+        compilation that raises discards its partial collector, so retrying never
+        carries over half-collected values.
+
+        ``parameter`` accepts either a parameter style class (e.g.
+        ``NamedParameter``) or an instance whose style is copied. Values wrapped
+        automatically are collected in render order. A hand-written
+        ``Parameter`` embedded in the tree renders its placeholder as-is and is
+        not bound by PyPika; use ``ParameterValueWrapper`` to pair such a
+        placeholder with an explicit value. With ``strict=True`` (the default)
+        any unbound hand-written placeholder raises ``ParameterException`` rather
+        than silently dropping a required binding. Pass ``strict=False`` to keep
+        the placeholders and bind them outside PyPika.
+        """
+        collector = self._new_parameter_collector(parameter)
+        if not hasattr(collector, "_parameters"):
+            raise ParameterException(
+                "parameter must be a ListParameter or DictParameter style that collects values, "
+                "got {cls}".format(cls=type(collector).__name__)
+            )
+
+        sql = self.get_sql(parameter=collector, **kwargs)
+
+        unbound = collector.get_manual_placeholders()
+        if strict and unbound:
+            raise ParameterException(
+                "Query contains placeholders without bound values: {placeholders}. "
+                "Wrap their values with ParameterValueWrapper or pass strict=False to bind them "
+                "outside PyPika.".format(placeholders=unbound)
+            )
+
+        return sql, collector.get_parameters()
 
     def _apply_pagination(self, querystring: str, **kwargs) -> str:
         if self._limit is not None:

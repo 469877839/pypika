@@ -1295,6 +1295,68 @@ This works with all parameter types. For dict-based parameters like ``NamedParam
     # sql: SELECT * FROM "customers" WHERE "status"=:param1
     # params: {'param1': 'active'}
 
+One-call Compilation
+"""""""""""""""""""""
+
+``get_parameterized_sql()`` compiles the query once and returns the SQL string and its parameters together,
+without the caller having to create and manage a parameter object:
+
+.. code-block:: python
+
+    from pypika import Query, Table, NamedParameter
+
+    customers = Table('customers')
+    q = Query.from_(customers).select('*').where(
+        (customers.status == 'active') & (customers.age >= 18)
+    )
+
+    sql, params = q.get_parameterized_sql(NamedParameter)
+
+    # sql: SELECT * FROM "customers" WHERE "status"=:param1 AND "age">=:param2
+    # params: {'param1': 'active', 'param2': 18}
+
+The argument accepts a parameter style class (``QmarkParameter``, ``FormatParameter``, ``NumericParameter``,
+``NamedParameter``, ``PyformatParameter``) or an existing parameter instance, whose style is copied. Omitting it
+defaults to qmark (``?``) style. A fresh collector is created for every call, so:
+
+- the reusable query tree never carries collection state;
+- compiling the same cached query repeatedly, including from multiple threads, always returns parameters matching
+  the placeholders rendered in that call;
+- an expression referenced more than once (e.g. in both ``SELECT`` and ``WHERE``) collects one value per rendered
+  placeholder;
+- if compilation raises, the partial collector is discarded, so retrying never carries over half-collected values.
+
+Mixing Hand-written Placeholders and Auto-wrapped Values
+""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+Values supplied directly to the query (such as ``customers.age >= 18``) are wrapped automatically and collected by
+the compiler. A hand-written ``Parameter`` term embedded in the query, by contrast, only renders its placeholder;
+PyPika has no value to bind to it. The binding boundary is therefore explicit:
+
+- By default (``strict=True``), ``get_parameterized_sql()`` raises ``ParameterException`` listing any hand-written
+  placeholders that have no bound value, instead of silently dropping a required binding.
+- Pass ``strict=False`` to keep those placeholders in the SQL and bind them yourself outside PyPika; only the
+  auto-wrapped values are returned.
+- Use ``ParameterValueWrapper`` to pair a hand-written placeholder with an explicit value so it is collected
+  together with the auto-wrapped ones:
+
+.. code-block:: python
+
+    from pypika import NamedParameter, Query, Table
+    from pypika.terms import ParameterValueWrapper
+
+    customers = Table('customers')
+    q = Query.from_(customers).select('*').where(
+        customers.id == ParameterValueWrapper(NamedParameter('id'), 42)
+    )
+
+    sql, params = q.get_parameterized_sql(NamedParameter)
+
+    # sql: SELECT * FROM "customers" WHERE "id"=:id
+    # params: {'id': 42}
+
+The legacy ``get_sql(parameter=parameter)`` / ``parameter.get_parameters()`` workflow keeps working unchanged.
+
 Temporal support
 ^^^^^^^^^^^^^^^^
 

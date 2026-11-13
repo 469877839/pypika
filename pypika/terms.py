@@ -374,19 +374,54 @@ class Parameter(Term):
     def __init__(self, placeholder: str | int) -> None:
         super().__init__()
         self._placeholder = placeholder
+        # Placeholders written by hand (a Parameter embedded in the query tree
+        # rather than a value auto-wrapped during a compilation) are not bound by
+        # PyPika. The per-compilation collector records them here so callers can
+        # be told which placeholders they must bind themselves instead of the
+        # missing value being silently swallowed.
+        self._manual_placeholders: list = []
 
     @property
     def placeholder(self):
         return self._placeholder
 
     def get_sql(self, **kwargs: Any) -> str:
-        return str(self.placeholder)
+        param_sql = str(self.placeholder)
+        parameter = kwargs.get("parameter")
+        if parameter is not None:
+            parameter.note_manual_placeholder(param_sql)
+        return param_sql
 
     def update_parameters(self, param_key: Any, param_value: Any, **kwargs) -> None:
         pass
 
     def get_param_key(self, placeholder: T, **kwargs) -> T:
         return placeholder
+
+    def note_manual_placeholder(self, placeholder: Any) -> None:
+        self._manual_placeholders.append(placeholder)
+
+    def get_manual_placeholders(self) -> list:
+        return self._manual_placeholders
+
+    def mark_placeholder_bound(self, placeholder: Any) -> None:
+        # ParameterValueWrapper pairs a hand-written placeholder with an explicit
+        # value, so the placeholder no longer needs an externally supplied binding.
+        if placeholder in self._manual_placeholders:
+            self._manual_placeholders.remove(placeholder)
+
+    def get_parameters(self, **kwargs) -> list | dict:
+        return []
+
+    def new_collector(self) -> "Parameter":
+        """
+        Build a fresh collector of the same style for a single compilation.
+
+        The returned object owns the values collected during one compilation, so
+        the reusable query tree never carries collection state and concurrent
+        compilations of the same query are isolated.
+        """
+        return type(self)(self._placeholder)
 
 
 class ListParameter(Parameter):
@@ -428,6 +463,9 @@ class DictParameter(Parameter):
 
     def update_parameters(self, param_key: Any, value: Any, **kwargs) -> None:
         self._parameters[param_key] = value
+
+    def get_parameters(self, **kwargs) -> dict:
+        return self._parameters
 
 
 class QmarkParameter(ListParameter):
@@ -569,7 +607,11 @@ class ParameterValueWrapper(ValueWrapper):
         self._parameter = parameter
 
     def _get_param_data(self, parameter: Parameter, **kwargs) -> tuple[str, str]:
+        # Register the placeholder through the normal hand-written path first,
+        # then mark it bound: this wrapper is the explicit binding boundary where
+        # the caller supplied a value for their own placeholder.
         param_sql = self._parameter.get_sql(**kwargs)
+        parameter.mark_placeholder_bound(param_sql)
         param_key = self._parameter.get_param_key(placeholder=param_sql)
 
         return param_sql, param_key

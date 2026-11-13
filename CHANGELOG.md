@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### New Features
+
+- **One-call parameterized compilation** - `QueryBuilder.get_parameterized_sql()` returns `(sql, parameters)`
+  with a fresh per-call collector, separating compilation state from the reusable query tree. Repeated and
+  concurrent compilations stay isolated, failed compilations cannot leak partial parameters, and hand-written
+  `Parameter` placeholders without a bound value raise `ParameterException` instead of being silently dropped
+  (`strict=False` restores opt-in external binding).
+
 ## v0.50.0 (2025-01-14)
 
 ### New Features

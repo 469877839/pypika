@@ -113,6 +113,7 @@ from pypika.utils import (
     FunctionException,
     GroupingException,
     JoinException,
+    ParameterException,
     QueryException,
     RollupException,
     SetOperationException,
@@ -177,6 +178,7 @@ __all__ = (
     'RollupException',
     'SetOperationException',
     'FunctionException',
+    'ParameterException',
     'NULL',
     'SYSTEM_TIME',
 )
