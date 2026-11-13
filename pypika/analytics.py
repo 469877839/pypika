@@ -7,7 +7,12 @@ from __future__ import annotations
 from pypika.terms import (
     AnalyticFunction,
     IgnoreNullsAnalyticFunction,
+    NamedWindow,
+    Window,
+    WindowDefinition,
     WindowFrameAnalyticFunction,
+    WindowRef,
+    WindowReference,
 )
 
 __author__ = "Timothy Heys"

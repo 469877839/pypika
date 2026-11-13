@@ -21,12 +21,16 @@ from pypika.terms import (
     Term,
     Tuple,
     ValueWrapper,
+    Window,
+    WindowContext,
+    supports_named_windows,
 )
 from pypika.utils import (
     JoinException,
     QueryException,
     RollupException,
     SetOperationException,
+    WindowException,
     builder,
     format_alias_sql,
     format_quotes,
@@ -776,6 +780,7 @@ class QueryBuilder(Selectable, Term):
         self._replace = False
 
         self._with = []
+        self._windows = []
         self._selects = []
         self._force_indexes = []
         self._use_indexes = []
@@ -824,6 +829,7 @@ class QueryBuilder(Selectable, Term):
         newone._select_star_tables = copy(self._select_star_tables)
         newone._from = copy(self._from)
         newone._with = copy(self._with)
+        newone._windows = copy(self._windows)
         newone._selects = copy(self._selects)
         newone._columns = copy(self._columns)
         newone._values = copy(self._values)
@@ -915,6 +921,44 @@ class QueryBuilder(Selectable, Term):
             self._select_into = True
 
         self._insert_table = table if isinstance(table, Table) else Table(table)
+
+    @builder
+    def window(self, *windows: Any, **kwargs: Any) -> None:
+        name = kwargs.pop("name", None)
+        if name is not None:
+            windows = (name,) + windows
+
+        if not windows:
+            raise WindowException("At least one window definition is required")
+
+        if isinstance(windows[0], str) and len(windows) == 1:
+            definitions = [Window(windows[0], **kwargs)]
+        elif isinstance(windows[0], str) and len(windows) == 2 and isinstance(windows[1], Window):
+            definition = copy(windows[1])
+            definition.name = windows[0]
+            definitions = [definition]
+        elif windows and all(isinstance(window, str) for window in windows) and not kwargs:
+            definitions = [Window(window) for window in windows]
+        elif isinstance(windows[0], str) and all(not isinstance(window, Window) for window in windows[1:]):
+            definitions = [Window(windows[0], *windows[1:], **kwargs)]
+        else:
+            if kwargs:
+                raise WindowException("Window options can only be used when defining one window by name")
+            definitions = []
+            for window in windows:
+                if isinstance(window, str):
+                    definitions.append(Window(window))
+                elif isinstance(window, Window):
+                    definitions.append(window)
+                else:
+                    raise WindowException(f"Expected a Window definition, got {window!r}")
+
+        for definition in definitions:
+            if definition.name is None:
+                raise WindowException("Window definitions must have a name")
+            self._windows.append(definition)
+
+    windows = window
 
     @builder
     def select(self, *terms: Any) -> None:
@@ -1309,7 +1353,10 @@ class QueryBuilder(Selectable, Term):
         kwargs.setdefault("dialect", self.dialect)
 
     def get_sql(self, with_alias: bool = False, subquery: bool = False, **kwargs: Any) -> str:
+        kwargs = dict(kwargs)
         self._set_kwargs_defaults(kwargs)
+        kwargs["parent_window_context"] = kwargs.get("window_context")
+        kwargs["window_context"] = WindowContext(self._windows)
         if not (self._selects or self._insert_table or self._delete_from or self._update_table):
             return ""
         if self._insert_table and not (self._selects or self._values):
@@ -1412,6 +1459,9 @@ class QueryBuilder(Selectable, Term):
 
         if self._havings:
             querystring += self._having_sql(**kwargs)
+
+        if self._windows and supports_named_windows(kwargs.get("dialect")):
+            querystring += self._window_sql(**kwargs)
 
         if self._qualifys:
             querystring += self._qualify_sql(**kwargs)
@@ -1599,6 +1649,15 @@ class QueryBuilder(Selectable, Term):
 
     def _rollup_sql(self) -> str:
         return " WITH ROLLUP"
+
+    def _window_sql(self, **kwargs: Any) -> str:
+        context = kwargs.get("window_context")
+        windows = context.ordered if context is not None else self._windows
+        definitions = ",".join(
+            f"{window.get_reference_sql(**kwargs)} AS ({window.get_definition_sql(**kwargs)})"
+            for window in windows
+        )
+        return " WINDOW " + definitions
 
     def _having_sql(self, quote_char: str | None = None, **kwargs: Any) -> str:
         return " HAVING {having}".format(having=self._havings.get_sql(quote_char=quote_char, **kwargs))

@@ -41,6 +41,10 @@ class RollupException(Exception):
     pass
 
 
+class WindowException(QueryException):
+    pass
+
+
 class DialectNotSupported(Exception):
     pass
 

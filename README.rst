@@ -1218,6 +1218,39 @@ Unbounded ranges use ``an.Preceding()`` or ``an.Following()`` without arguments.
     SELECT "date","amount",SUM("amount") OVER(PARTITION BY "account_id" ORDER BY "date" ROWS BETWEEN 7 PRECEDING AND CURRENT ROW) "rolling_7_day" FROM "transactions"
 
 
+Named Windows
+"""""""""""""
+
+A window can be defined once and referenced by any number of analytic functions in the same ``SELECT``.
+Window names are scoped to that ``SELECT``, so a subquery can define its own window with the same name.
+A window can also extend an earlier window; clauses may only be appended in SQL order, so a child cannot
+replace an inherited ``PARTITION BY``, ``ORDER BY``, or frame.
+
+.. code-block:: python
+
+    from pypika import Query, Table, analytics as an
+    from pypika.terms import Window
+
+    t = Table("transactions")
+    base = Window("account_window").partitionby(t.account_id)
+    rolling = Window("rolling_window").based_on(base).orderby(t.created_at).rows(
+        an.Preceding(6), an.CURRENT_ROW
+    )
+
+    q = Query.from_(t).select(
+        t.created_at,
+        an.Sum(t.amount).over(rolling).as_("rolling_7_day"),
+        an.Avg(t.amount).over(rolling).as_("rolling_7_day_avg"),
+    ).window(base, rolling)
+
+.. code-block:: sql
+
+    SELECT "created_at",SUM("amount") OVER "rolling_window" "rolling_7_day",AVG("amount") OVER "rolling_window" "rolling_7_day_avg" FROM "transactions" WINDOW "account_window" AS (PARTITION BY "account_id"),"rolling_window" AS ("account_window" ORDER BY "created_at" ROWS BETWEEN 6 PRECEDING AND CURRENT ROW)
+
+Duplicate names, unknown references, circular inheritance, and clause overriding are reported as
+``WindowException`` before a final SQL string is returned. Dialects with a native ``WINDOW`` clause emit it
+directly; dialects without one, such as MSSQL and Oracle, expand the resolved definitions inline.
+
 Parametrized Queries
 ^^^^^^^^^^^^^^^^^^^^
 

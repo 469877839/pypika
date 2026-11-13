@@ -96,6 +96,7 @@ from pypika.terms import (
     Index,
     Interval,
     NamedParameter,
+    NamedWindow,
     Not,
     NullValue,
     NumericParameter,
@@ -105,6 +106,10 @@ from pypika.terms import (
     Rollup,
     SystemTimeValue,
     Tuple,
+    Window,
+    WindowDefinition,
+    WindowRef,
+    WindowReference,
 )
 
 # noinspection PyUnresolvedReferences
@@ -116,6 +121,7 @@ from pypika.utils import (
     QueryException,
     RollupException,
     SetOperationException,
+    WindowException,
 )
 
 __author__ = "Timothy Heys"
@@ -168,6 +174,11 @@ __all__ = (
     'PyformatParameter',
     'Rollup',
     'Tuple',
+    'Window',
+    'NamedWindow',
+    'WindowDefinition',
+    'WindowReference',
+    'WindowRef',
     'CustomFunction',
     'CaseException',
     'GroupingException',
@@ -176,6 +187,7 @@ __all__ = (
     'QueryException',
     'RollupException',
     'SetOperationException',
+    'WindowException',
     'FunctionException',
     'NULL',
     'SYSTEM_TIME',
